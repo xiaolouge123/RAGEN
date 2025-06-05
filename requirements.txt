@@ -27,6 +27,8 @@ debugpy
 
 together
 anthropic
+browsergym==0.10.2
+# browsergym-core 安装本地自定义修改版本。
 
 # This is optional, but needs to be installed with main requirements if you want to use webshop
 -r external/webshop-minimal/requirements.txt
