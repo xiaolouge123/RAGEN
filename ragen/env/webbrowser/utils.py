@@ -12,11 +12,14 @@ from typing import Callable
 from uuid import UUID, uuid4
 
 from uvicorn.server import HANDLED_SIGNALS
+from tenacity import RetryCallState
+from tenacity.stop import stop_base
 
 from ragen.log import openhands_logger as logger
 
 _should_exit = None
 _shutdown_listeners: dict[UUID, Callable] = {}
+
 
 
 def _register_signal_handler(sig: signal.Signals) -> None:
@@ -92,3 +95,21 @@ def add_shutdown_listener(callable: Callable) -> UUID:
 
 def remove_shutdown_listener(id_: UUID) -> bool:
     return _shutdown_listeners.pop(id_, None) is not None
+
+
+class stop_if_should_exit(stop_base):
+    """Stop if the should_exit flag is set."""
+
+    def __call__(self, retry_state: 'RetryCallState') -> bool:
+        return bool(should_exit())
+
+
+# reward functions
+def format_response_reward(response: str):
+    pass
+
+def format_valid_action_reward(action_str: str):
+    pass
+
+def task_complete_reward(is_correct: bool):
+    pass
