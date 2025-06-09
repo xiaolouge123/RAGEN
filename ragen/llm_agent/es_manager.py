@@ -12,6 +12,8 @@ import numpy as np
 
 from ragen.env import REGISTERED_ENVS, REGISTERED_ENV_CONFIGS
 from ragen.utils import register_resolvers
+from ragen.llm_agent.observations import BrowserOutputObservation
+
 register_resolvers()
 
 @dataclass
@@ -54,6 +56,7 @@ class EnvStateManager:
         self.envs = self._init_env_instances(self.config)
 
     def _init_env_instances(self, config):
+        print("Init envs... env counts: ", sum(config.env_configs.n_groups)* self.group_size)
         env_list = []
         done_groups = 0
         for tag, n_group in zip(config.env_configs.tags, config.env_configs.n_groups):
@@ -66,6 +69,7 @@ class EnvStateManager:
                 else:
                     env_config = REGISTERED_ENV_CONFIGS[env_class](**cfg_template.env_config)
                 env_obj = REGISTERED_ENVS[env_class](env_config)
+                print(f"Init env {env_id} of tag {tag}")
                 entry = {'tag': tag, 'group_id': env_id // self.group_size, 'env_id': env_id, 
                         'env': env_obj, 'config': env_config, 'status': EnvStatus(), 'max_actions_per_traj': max_actions_per_traj}
                 env_list.append(entry)
@@ -131,7 +135,7 @@ class EnvStateManager:
             obs = self._handle_mm_state(cur_obs)
             status.num_actions += len(executed_actions)
             status.rewards.append(acc_reward) # NOTE use turn-wise acc_reward
-            actions_left = max_actions_per_traj - status.num_actions
+            actions_left = max_actions_per_traj - status.num_actions # TODO 对于支持多个 action 连续输入的 env, 这里的计算逻辑要修改一下
             if turn_done:
                 status.terminated = True # TODO check terminated definition in gymnasium
                 status.truncated = not turn_info.get('success', False)
@@ -154,7 +158,11 @@ class EnvStateManager:
 
             # execute actions in envs
             valid_actions = self._extract_map_valid_actions(entry, env_input['actions'])
-            acc_reward, turn_info, turn_done, executed_actions = _execute_actions(env, valid_actions[:actions_left_before])
+            finally_answer = env_input.get('final_answer', None)
+            if finally_answer is not None and finally_answer != "":
+                acc_reward, turn_info, turn_done, executed_actions = _execute_actions(env, [finally_answer])
+            else:
+                acc_reward, turn_info, turn_done, executed_actions = _execute_actions(env, valid_actions[:actions_left_before])
             if len(valid_actions) != len(env_input['actions']) or not valid_actions:
                 self.rollout_cache[env_id]["penalty"] += self.sys_config.es_manager.format_penalty
                 
@@ -206,9 +214,6 @@ class EnvStateManager:
                 cache['correct_answer'] = entry['env'].correct_answer
         return rollout_cache
 
-
-
-
     def _update_cache_history(self, history: List[Dict], next_state, actions_left, num_actions_info: Optional[Dict] = None):
         """
         Update last step info and append state to history
@@ -217,11 +222,15 @@ class EnvStateManager:
             assert len(history), "History should not be empty"
             history[-1].update(num_actions_info)
         
+        # TODO 这里未来还需要考虑 图文混合的适配
         entry = {} # append state to history
         if isinstance(next_state, str): # text state
             entry['state'] = next_state
+        elif isinstance(next_state, BrowserOutputObservation): # 以后和 BrowserOutputObservation 的适配都在这里处理，方便统一控制。
+            entry['state'] = str(next_state)
+            entry['condensed_state'] = next_state.get_condensed_observation()
         else: # multimodal state
-            entry['state'] = "<images>" * len(next_state)
+            entry['state'] = "<images>" * len(next_state) # TODO 这里应该是针对 qwen 多模的适配，可能还不通用。还要考虑多模态输入的适配
             entry['images'] = next_state
         entry['actions_left'] = actions_left
         history.append(entry)
@@ -239,13 +248,17 @@ class EnvStateManager:
             mapped_actions = [rev_action_lookup[action] for action in actions if action in rev_action_lookup]
         return mapped_actions
     
-    def _handle_mm_state(self, state: Union[str, np.ndarray, list[np.ndarray]]):
+    def _handle_mm_state(self, state: Union[str, np.ndarray, list[np.ndarray], BrowserOutputObservation]):
         """Handle the state from the environment
         """
         if isinstance(state, str): # text state
             return state
         elif isinstance(state, np.ndarray): # when env state is a single image, convert it to a list to unify output format
             state = [state]
+        elif isinstance(state, BrowserOutputObservation): # TODO 这里未来还需要考虑 图文混合的适配
+            return state # 还是要在history 中保留原始完整的信息
+        elif state is None:
+            return "None"
         results = [PIL.Image.fromarray(_state, mode='RGB') for _state in state]
         return results
         

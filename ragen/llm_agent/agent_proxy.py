@@ -146,8 +146,10 @@ class LLMAgentProxy:
 		env_outputs = es_manager.reset()
 
 		for i in range(self.config.agent_proxy.max_turn):
-			lm_inputs: DataProto = ctx_manager.get_lm_inputs(env_outputs, prepare_for_update=False)
+			print(f'[DEBUG] rollout turn {i}')
+			lm_inputs: DataProto = ctx_manager.get_lm_inputs(env_outputs, prepare_for_update=False) # 获取当前轮次的 prefill prompts
 			lm_inputs.meta_info = dataproto.meta_info # TODO: setup vllm early stop when max length is reached. make sure this can be done
+			print(f'[DEBUG] rollout turn {i} lm_inputs: {lm_inputs.non_tensor_batch["messages_list"][0]}')
 			lm_outputs: DataProto = self.generate_sequences(lm_inputs)
 			env_inputs: List[Dict] = ctx_manager.get_env_inputs(lm_outputs)
 			env_outputs: List[Dict] = es_manager.step(env_inputs)

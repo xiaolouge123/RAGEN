@@ -8,7 +8,6 @@ from datetime import datetime
 from types import TracebackType
 from typing import Any, Literal, Mapping, TextIO
 
-import litellm
 from pythonjsonlogger.json import JsonFormatter
 from termcolor import colored
 
@@ -20,24 +19,6 @@ DEBUG_LLM = os.getenv('DEBUG_LLM', 'False').lower() in ['true', '1', 'yes']
 LOG_JSON = os.getenv('LOG_JSON', 'False').lower() in ['true', '1', 'yes']
 LOG_JSON_LEVEL_KEY = os.getenv('LOG_JSON_LEVEL_KEY', 'level')
 
-
-# Configure litellm logging based on DEBUG_LLM
-if DEBUG_LLM:
-    confirmation = input(
-        '\n⚠️ WARNING: You are enabling DEBUG_LLM which may expose sensitive information like API keys.\n'
-        'This should NEVER be enabled in production.\n'
-        "Type 'y' to confirm you understand the risks: "
-    )
-    if confirmation.lower() == 'y':
-        litellm.suppress_debug_info = False
-        litellm.set_verbose = True
-    else:
-        print('DEBUG_LLM disabled due to lack of confirmation')
-        litellm.suppress_debug_info = True
-        litellm.set_verbose = False
-else:
-    litellm.suppress_debug_info = True
-    litellm.set_verbose = False
 
 if DEBUG:
     LOG_LEVEL = 'DEBUG'
@@ -387,85 +368,3 @@ if LOG_TO_FILE:
         get_file_handler(LOG_DIR, current_log_level)
     )  # default log to project root
     openhands_logger.debug(f'Logging to file in: {LOG_DIR}')
-
-# Exclude LiteLLM from logging output
-logging.getLogger('LiteLLM').disabled = True
-logging.getLogger('LiteLLM Router').disabled = True
-logging.getLogger('LiteLLM Proxy').disabled = True
-
-
-class LlmFileHandler(logging.FileHandler):
-    """LLM prompt and response logging."""
-
-    def __init__(
-        self,
-        filename: str,
-        mode: str = 'a',
-        encoding: str = 'utf-8',
-        delay: bool = False,
-    ) -> None:
-        """Initializes an instance of LlmFileHandler.
-
-        Args:
-            filename (str): The name of the log file.
-            mode (str, optional): The file mode. Defaults to 'a'.
-            encoding (str, optional): The file encoding. Defaults to None.
-            delay (bool, optional): Whether to delay file opening. Defaults to False.
-        """
-        self.filename = filename
-        self.message_counter = 1
-        if DEBUG:
-            self.session = datetime.now().strftime('%y-%m-%d_%H-%M')
-        else:
-            self.session = 'default'
-        self.log_directory = os.path.join(LOG_DIR, 'llm', self.session)
-        os.makedirs(self.log_directory, exist_ok=True)
-        if not DEBUG:
-            # Clear the log directory if not in debug mode
-            for file in os.listdir(self.log_directory):
-                file_path = os.path.join(self.log_directory, file)
-                try:
-                    os.unlink(file_path)
-                except Exception as e:
-                    openhands_logger.error(
-                        'Failed to delete %s. Reason: %s', file_path, e
-                    )
-        filename = f'{self.filename}_{self.message_counter:03}.log'
-        self.baseFilename = os.path.join(self.log_directory, filename)
-        super().__init__(self.baseFilename, mode, encoding, delay)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        """Emits a log record.
-
-        Args:
-            record (logging.LogRecord): The log record to emit.
-        """
-        filename = f'{self.filename}_{self.message_counter:03}.log'
-        self.baseFilename = os.path.join(self.log_directory, filename)
-        self.stream = self._open()
-        super().emit(record)
-        self.stream.close()
-        openhands_logger.debug('Logging to %s', self.baseFilename)
-        self.message_counter += 1
-
-
-def _get_llm_file_handler(name: str, log_level: int) -> LlmFileHandler:
-    # The 'delay' parameter, when set to True, postpones the opening of the log file
-    # until the first log message is emitted.
-    llm_file_handler = LlmFileHandler(name, delay=True)
-    llm_file_handler.setFormatter(llm_formatter)
-    llm_file_handler.setLevel(log_level)
-    return llm_file_handler
-
-
-def _setup_llm_logger(name: str, log_level: int) -> logging.Logger:
-    logger = logging.getLogger(name)
-    logger.propagate = False
-    logger.setLevel(log_level)
-    if LOG_TO_FILE:
-        logger.addHandler(_get_llm_file_handler(name, log_level))
-    return logger
-
-
-llm_prompt_logger = _setup_llm_logger('prompt', current_log_level)
-llm_response_logger = _setup_llm_logger('response', current_log_level)

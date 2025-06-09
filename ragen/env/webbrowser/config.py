@@ -5,18 +5,20 @@ from typing import Tuple, Optional, Dict, List
 class WebBrowserEnvConfig:
     """Configuration for WebBrowserEnv environment"""
     # Dataset config
-    dataset_name: str = field(default="web_crawler_stage_1")
-    cache_dir: str = field(default="./data")
-    split: Optional[str] = field(default=None)
+    train_path: str = field(default="data/webbrowser/train.parquet")
+    val_path: str = field(default="data/webbrowser/val.parquet")
 
     # env settings
     max_steps: int = field(default=100)
+
+    # agent settings
     enable_visual: bool = field(default=False)
-    high_level_action_set: Optional[List[str]] = field(default=["bid", "nav"])
+    high_level_action_set: Optional[List[str]] = field(default=None)
     strict: bool = field(default=False)
     multiaction: bool = field(default=True)
     
     # browsering settings
     search_engine: str = field(default="bing.com")
+    browser_retries_limit: int = field(default=3)
     
     

@@ -4,7 +4,7 @@ author: Kangrui Wang, Zihan Wang
 date: 2025-03-30
 """
 from itertools import zip_longest
-
+from datetime import datetime
 import torch
 import numpy as np
 from typing import List, Dict, Any, Optional, Union
@@ -98,6 +98,7 @@ class ContextManager:
                 env_tag: n_group * self.es_cfg.group_size
                 for n_group, env_tag in zip(self.es_cfg.env_configs.n_groups, self.es_cfg.env_configs.tags)
         }
+        print(self.env_nums)
         self._init_prefix_lookup()
     
     def _check_env_installed(self, env_type: str):
@@ -125,6 +126,8 @@ class ContextManager:
                 action_lookup_str = "\nYour available actions are:\n" + ", ".join([f"{v}" for k, v in env_config_new["action_lookup"].items()])
                 action_lookup_str += f"\nYou can make up to {env_config_new['max_actions_per_traj']} actions, separated by the action separator \" " + self.action_sep + " \"\n"
                 env_instruction += action_lookup_str
+            if env_config_new.get("enable_world_info", False):
+                env_instruction += f"\n<CURRENT_WORLD_INFO>\nCurrent date: {datetime.now().strftime('%Y-%m-%d')}\nCurrent time: {datetime.now().strftime('%H:%M:%S')}\n</CURRENT_WORLD_INFO>"
             prefixes[env_tag] = env_instruction
             env_config_lookup[env_tag] = {'max_tokens': env_config.get("max_tokens", self.config.actor_rollout_ref.rollout.response_length)}
 
@@ -145,8 +148,63 @@ class ContextManager:
         self.prefix_lookup = prefix_lookup
         self.env_config_lookup = env_config_lookup
 
-    def _parse_response(self, response: str) -> List:
+    def _parse_webbrowser_response(self, response: str) -> List:
+        """
+        return: thought, actions, answer
+        """
+        action_pattern = r'<think>(.*?)</think>\s*<actions>(.*?)</actions>'
+        answer_pattern = r'<think>(.*?)</think>\s*<answer>(.*?)</answer>'
+        if "<actions>" in response:
+            match = re.search(action_pattern, response, re.DOTALL)
+            if not match:
+                return "", [], ""
+            else:
+                thought =  match.group(1)
+                action_str = match.group(2)
+                answer = "" # 默认 actions 出现的时候 answer 是空的
+
+                for special_token in self.special_token_list:
+                    action_str = action_str.replace(special_token, "").strip()
+                    thought = thought.replace(special_token, "").strip()
+                
+                actions = [action.strip() for action in action_str.split(self.action_sep) if action.strip()]
+                max_actions = self.config.agent_proxy.max_actions_per_turn
+                if len(actions) > max_actions:
+                    actions = actions[:max_actions] #Only the first MAX_ACTIONS actions are kept in the rollout.
+                
+                return thought, actions, answer
+                    
+        elif "<answer>" in response:
+            match = re.search(answer_pattern, response, re.DOTALL)
+            if not match:
+                return "", [], ""
+            else:
+                return match.group(1), [], match.group(2)
+        else:
+            return "", [], ""
+
+    def _parse_response(self, response: str, env_tag: str) -> List:
         pattern = r'<think>(.*?)</think>\s*<answer>(.*?)</answer>' if self.config.agent_proxy.enable_think else r'<answer>(.*?)</answer>'
+        if env_tag in ["WebBrowser"]:
+            llm_response = response
+            actions = []
+            answer = ""
+
+            assert self.config.agent_proxy.enable_think == True, "WebBrowser env requires enable_think to be True"
+            think_content, actions, answer = self._parse_webbrowser_response(response)
+            if think_content == "":
+                llm_response, actions, answer = response, [], ""
+            else:
+                if len(actions) >= 1:
+                    action_content = (self.action_sep).join(actions)
+                    actions = [action_content] # webbrowser env 可以消费多个 action 的  string，只要是 \n 分割的即可
+                    llm_response = f"<think>{think_content}</think><actions>{action_content}</actions>"
+                if answer != "":
+                    llm_response = f"<think>{think_content}</think><answer>{answer}</answer>"
+                    answer = f"<answer>{answer}</answer>"
+
+            return llm_response, actions, answer
+        
         match = re.search(pattern, response, re.DOTALL)
         if not match:
             # think_content, action_content, actions = "", "", [] # do not remove this kind of invalid string
@@ -170,7 +228,7 @@ class ContextManager:
                 action_content = (" " + self.action_sep + " ").join(actions)
 
             llm_response = f"<think>{think_content}</think><answer>{action_content}</answer>" if self.config.agent_proxy.enable_think else f"<answer>{action_content}</answer>"
-        return llm_response, actions
+        return llm_response, actions, None
         
     def _normalize_score_tensor(self, score_tensor: torch.Tensor, env_outputs: List[Dict]) -> torch.Tensor:
         """
@@ -244,18 +302,37 @@ class ContextManager:
                 {"role": "system", "content": f"You're a helpful assistant. "}, 
                 {"role": "user", "content": self.prefix_lookup[env_output["env_id"]]}
             ]
+            env_tag = env_output["tag"]
 
             for idx, content in enumerate(env_output["history"]):
                 messages[-1]["content"] += f"\nTurn {idx + 1}:\n"
-                if "state" in content:
-                    FORMAT_PROMPT = "<think> [Your thoughts] </think> <answer> [your answer] </answer>" if self.config.agent_proxy.enable_think else "<answer> [your answer] </answer>"
-                    LENGTH_PROMPT = f"Max response length: {self.env_config_lookup[env_output['env_id']]['max_tokens']} words (tokens)."
-                    messages[-1]["content"] += f"State:\n{content['state']}\nYou have {content['actions_left']} actions left. Always output: {FORMAT_PROMPT} with no extra text. Strictly follow this format. {LENGTH_PROMPT}\n"
-                if "llm_response" in content:
-                    messages.append({"role": "assistant", "content": content["llm_response"]})
-                if "reward" in content and not (prepare_for_update and idx == len(env_output["history"]) - 1):
-                    # when prepare for update, we do not add the reward from the n+1 turn to the trajectory
-                    messages.append({"role": "user", "content": f"Reward:\n{content['reward']}\n"})
+                if env_tag in ["WebBrowser"]:
+                    LENGTH_PROMPT = f"\nMax response length: {self.env_config_lookup[env_output['env_id']]['max_tokens']} words (tokens)."
+                    if "state" in content:
+                        if idx + 1 < len(env_output["history"]):
+                            # 说明这是最后一个轮次之前的 state， 只需要添加 condensed observation
+                            messages[-1]["content"] += f"State:\n{content['condensed_state']}"
+                        else:
+                            messages[-1]["content"] += f"State:\n{content['state']}"
+                        if idx == 0:
+                            messages[-1]["content"] += LENGTH_PROMPT # 只在首轮次添加回复长度限制。format prompt 已经在配置文件中添加了。
+                    if "llm_response" in content:
+                        messages.append({"role": "assistant", "content": content["llm_response"]})
+                    if "reward" in content and not (prepare_for_update and idx == len(env_output["history"]) - 1):
+                        # when prepare for update, we do not add the reward from the n+1 turn to the trajectory
+                        messages.append({"role": "user", "content": f"Reward:\n{content['reward']}\n"})
+                
+                else:
+                    # TODO 这里很奇怪额。如果 history 是多轮次的的，FORMAR_PROMPT 和 LENGTH_PROMPT 会在每个 turn 都重复，这明显没太大的必要。
+                    if "state" in content:
+                        FORMAT_PROMPT = "<think> [Your thoughts] </think> <answer> [your answer] </answer>" if self.config.agent_proxy.enable_think else "<answer> [your answer] </answer>"
+                        LENGTH_PROMPT = f"Max response length: {self.env_config_lookup[env_output['env_id']]['max_tokens']} words (tokens)."
+                        messages[-1]["content"] += f"State:\n{content['state']}\nYou have {content['actions_left']} actions left. Always output: {FORMAT_PROMPT} with no extra text. Strictly follow this format. {LENGTH_PROMPT}\n"
+                    if "llm_response" in content:
+                        messages.append({"role": "assistant", "content": content["llm_response"]})
+                    if "reward" in content and not (prepare_for_update and idx == len(env_output["history"]) - 1):
+                        # when prepare for update, we do not add the reward from the n+1 turn to the trajectory
+                        messages.append({"role": "user", "content": f"Reward:\n{content['reward']}\n"})
                     
 
             # NOTE: this assertion is important for loss mask computation        
@@ -263,7 +340,7 @@ class ContextManager:
 
             text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=False)
             if not prepare_for_update:
-                if self.config.agent_proxy.enable_think:
+                if self.config.agent_proxy.enable_think: # TODO 这里代码和配置文件耦合了，envs.yaml 配置文件中，对于输出的限定可能花样更多。 处理不好就有可能出错。
                     text += "<think>" # force the LLM to think before answering
                 else:
                     text += "<answer>" # force the LLM to answer
@@ -297,6 +374,7 @@ class ContextManager:
         llm_inputs.non_tensor_batch = {
             "env_ids": np.array([env_output["env_id"] for env_output in env_outputs], dtype=object),
             "group_ids": np.array([env_output["group_id"] for env_output in env_outputs], dtype=object),
+            "env_tags": np.array([env_output["tag"] for env_output in env_outputs], dtype=object), # 用来控制后续的 llm response 解析
             "messages_list": np.array(messages_list, dtype=object),
         }
 
@@ -335,14 +413,16 @@ class ContextManager:
         responses = ["<think>" + response if self.config.agent_proxy.enable_think else "<answer>" + response for response in responses] # The LLM generation does not include <think> tags. Add them back here.
             
         env_ids = lm_outputs.non_tensor_batch['env_ids']
+        env_tags = lm_outputs.non_tensor_batch['env_tags']
         env_inputs = []
-        for env_id, response in zip(env_ids, responses):
-            llm_response, actions = self._parse_response(response)
+        for env_id, env_tag, response in zip(env_ids, env_tags, responses):
+            llm_response, actions, answer = self._parse_response(response, env_tag)
             env_inputs.append({
                 "env_id": env_id,
                 "llm_raw_response": response,
                 "llm_response": llm_response,
                 "actions": actions,
+                "final_answer": answer, # TODO final_answer应该在哪实现结果对比。
             })
         return env_inputs
 
