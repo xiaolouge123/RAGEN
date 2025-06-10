@@ -152,9 +152,9 @@ class ContextManager:
         """
         return: thought, actions, answer
         """
-        action_pattern = r'<think>(.*?)</think>\s*<actions>(.*?)</actions>'
+        action_pattern = r'<think>(.*?)</think>\s*<action>(.*?)</action>'
         answer_pattern = r'<think>(.*?)</think>\s*<answer>(.*?)</answer>'
-        if "<actions>" in response:
+        if "<action>" in response:
             match = re.search(action_pattern, response, re.DOTALL)
             if not match:
                 return "", [], ""
@@ -198,7 +198,7 @@ class ContextManager:
                 if len(actions) >= 1:
                     action_content = (self.action_sep).join(actions)
                     actions = [action_content] # webbrowser env 可以消费多个 action 的  string，只要是 \n 分割的即可
-                    llm_response = f"<think>{think_content}</think><actions>{action_content}</actions>"
+                    llm_response = f"<think>{think_content}</think><action>{action_content}</action>"
                 if answer != "":
                     llm_response = f"<think>{think_content}</think><answer>{answer}</answer>"
                     answer = f"<answer>{answer}</answer>"
@@ -305,6 +305,9 @@ class ContextManager:
             env_tag = env_output["tag"]
 
             for idx, content in enumerate(env_output["history"]):
+                if idx == 0 and content.get("goal", None):
+                    messages[-1]["content"] += f"\n{content['goal']}" # 只在首轮次 user prompt 最后添加任务目标。
+                
                 messages[-1]["content"] += f"\nTurn {idx + 1}:\n"
                 if env_tag in ["WebBrowser"]:
                     LENGTH_PROMPT = f"\nMax response length: {self.env_config_lookup[env_output['env_id']]['max_tokens']} words (tokens)."
@@ -315,7 +318,7 @@ class ContextManager:
                         else:
                             messages[-1]["content"] += f"State:\n{content['state']}"
                         if idx == 0:
-                            messages[-1]["content"] += LENGTH_PROMPT # 只在首轮次添加回复长度限制。format prompt 已经在配置文件中添加了。
+                            messages[-1]["content"] += LENGTH_PROMPT # 只在首轮次 user prompt 最后添加回复长度限制。format prompt 已经在配置文件中添加了。
                     if "llm_response" in content:
                         messages.append({"role": "assistant", "content": content["llm_response"]})
                     if "reward" in content and not (prepare_for_update and idx == len(env_output["history"]) - 1):

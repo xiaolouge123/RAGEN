@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Any, Union
 import PIL.Image
 import hydra
 import random
+import concurrent.futures
+import copy
 import numpy as np
 
 from ragen.env import REGISTERED_ENVS, REGISTERED_ENV_CONFIGS
@@ -55,26 +57,43 @@ class EnvStateManager:
         assert len(self.config.env_configs.tags) == len(self.config.env_configs.n_groups), f"Number of tags must equal number of n_groups. Got {len(self.config.env_configs.tags)} != {len(self.config.env_configs.n_groups)}"
         self.envs = self._init_env_instances(self.config)
 
+    def _create_env_instance(self, args: tuple):
+        """Helper function to create a single environment instance."""
+        tag, group_id, env_id = args
+        cfg_template = self.sys_config.custom_envs[tag]
+        env_class = cfg_template.env_type
+        max_actions_per_traj = cfg_template.max_actions_per_traj
+        if cfg_template.env_config is None:
+            env_config = REGISTERED_ENV_CONFIGS[env_class]()
+        else:
+            env_config = REGISTERED_ENV_CONFIGS[env_class](**cfg_template.env_config)
+        env_obj = REGISTERED_ENVS[env_class](env_config)
+        print(f"Init env {env_id} of tag {tag}")
+        entry = {'tag': tag, 'group_id': group_id, 'env_id': env_id, 
+                'env': env_obj, 'config': env_config, 'status': EnvStatus(), 'max_actions_per_traj': max_actions_per_traj}
+        return entry
+
     def _init_env_instances(self, config):
         print("Init envs... env counts: ", sum(config.env_configs.n_groups)* self.group_size)
-        env_list = []
+        env_creation_args = []
         done_groups = 0
         for tag, n_group in zip(config.env_configs.tags, config.env_configs.n_groups):
             for env_id in range(done_groups * self.group_size, (done_groups + n_group) * self.group_size):
-                cfg_template = self.sys_config.custom_envs[tag]
-                env_class = cfg_template.env_type
-                max_actions_per_traj = cfg_template.max_actions_per_traj
-                if cfg_template.env_config is None:
-                    env_config = REGISTERED_ENV_CONFIGS[env_class]()
-                else:
-                    env_config = REGISTERED_ENV_CONFIGS[env_class](**cfg_template.env_config)
-                env_obj = REGISTERED_ENVS[env_class](env_config)
-                print(f"Init env {env_id} of tag {tag}")
-                entry = {'tag': tag, 'group_id': env_id // self.group_size, 'env_id': env_id, 
-                        'env': env_obj, 'config': env_config, 'status': EnvStatus(), 'max_actions_per_traj': max_actions_per_traj}
-                env_list.append(entry)
+                group_id = env_id // self.group_size
+                env_creation_args.append((tag, group_id, env_id))
             done_groups += n_group
+        
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            env_list = list(executor.map(self._create_env_instance, env_creation_args))
         return env_list
+
+    def _reset_env(self, args):
+        """Helper function to reset a single environment instance."""
+        entry, seed = args
+        entry['env'].reset(seed=seed, mode=self.mode)
+        status = EnvStatus(seed=seed)
+        next_state = self._handle_mm_state(entry['env'].render())
+        return entry['env_id'], status, next_state
 
     def reset(self, seed: Optional[int] = None):
         """
@@ -94,85 +113,100 @@ class EnvStateManager:
         else:
             seed = 123
         seeds = _expand_seed(seed)
-        for seed, entry in zip(seeds, envs):
-            entry['env'].reset(seed=seed, mode=self.mode)
-            entry['status'] = EnvStatus(seed=seed)
-
-        # update rollout cache
-        for cache, env in zip(rollout_cache, envs):
-            next_state = self._handle_mm_state(env['env'].render())
-            cache['history'] = self._update_cache_history(cache['history'], next_state=next_state, actions_left=env['max_actions_per_traj'], num_actions_info=None)
+        
+        reset_args = zip(envs, seeds)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = list(executor.map(self._reset_env, reset_args))
+        
+        # update env status and rollout cache
+        for env_id, status, next_state in results:
+            self.envs[env_id]['status'] = status
+            cache = rollout_cache[env_id]
+            cache['history'] = self._update_cache_history(
+                cache['history'], 
+                next_state=next_state, 
+                actions_left=self.envs[env_id]['max_actions_per_traj'], 
+                num_actions_info=None
+            )
             
         self.rollout_cache = rollout_cache
         return rollout_cache
 
-    def step(self, all_env_inputs: List[Dict]):
-        """Step the environments.
-        1. extract valid actions from the action lookup table (if exists) and execute the actions, and update rollout cache
-        2. Since rollout does not need to act over done envs, whenever the environment is done, we only update rollout cache, but not output env_outputs.
-        Input:
-        all_env_inputs: List[Dict]
-            {env_id: int, llm_response: str, actions: List[str]}
-            NOTE: should use env_id as index for existing some already done envs
-        env_outputs: List[Dict]
-            {env_id: int, history: List[Dict][{state: str, actions: List[str], reward: float, info: Dict, llm_response: str, llm_raw_response: str, (Optional)images: List[PIL.Image.Image]}]}
-        """
-        def _execute_actions(env, actions):
-            acc_reward, turn_info, turn_done = 0, {}, False
-            executed_actions = []
-            for action in actions:
-                _, reward, done, info = env.step(action)
-                acc_reward += reward
-                turn_info.update(info) # NOTE: currently use last info for multi-action
-                executed_actions.append(action)
-                if done:
-                    turn_done = True
-                    break
+    def _execute_actions(self, env, actions):
+        acc_reward, turn_info, turn_done = 0, {}, False
+        executed_actions = []
+        for action in actions:
+            _, reward, done, info = env.step(action)
+            acc_reward += reward
+            turn_info.update(info) # NOTE: currently use last info for multi-action
+            executed_actions.append(action)
+            if done:
+                turn_done = True
+                break
+        
+        return acc_reward, turn_info, turn_done, executed_actions
+
+    def _log_env_state(self, status, history, cur_obs, max_actions_per_traj, executed_actions, all_actions, acc_reward, turn_done, turn_info, env_input):
+        obs = self._handle_mm_state(cur_obs)
+        status.num_actions += len(executed_actions)
+        status.rewards.append(acc_reward) # NOTE use turn-wise acc_reward
+        actions_left = max_actions_per_traj - status.num_actions # TODO 对于支持多个 action 连续输入的 env, 这里的计算逻辑要修改一下
+        if turn_done:
+            status.terminated = True # TODO check terminated definition in gymnasium
+            status.truncated = not turn_info.get('success', False)
+        history = self._update_cache_history(history, next_state=obs, actions_left=actions_left, num_actions_info={
+            'actions': executed_actions, 'reward': acc_reward, 'info': turn_info,
+            'llm_response': env_input['llm_response'], 'llm_raw_response': env_input['llm_raw_response']
+        })
+        # filter out invalid actions
+        # history = [content for content in history[:-1] if content['actions']] + [history[-1]]
+        return status, history
+    
+    def _step_env(self, env_input):
+        """Helper function to step a single environment instance."""
+        env_id = env_input['env_id']
+        entry = self.envs[env_id]
+        env = entry['env']
+        
+        # Deepcopy status and history to avoid race conditions
+        status = EnvStatus(**vars(entry['status']))
+        history = copy.deepcopy(self.rollout_cache[env_id]['history'])
+
+        actions_left_before = entry['max_actions_per_traj'] - status.num_actions
+
+        # execute actions in envs
+        valid_actions = self._extract_map_valid_actions(entry, env_input['actions'])
+        final_answer = env_input.get('final_answer', None)
+        if final_answer is not None and final_answer != "":
+            acc_reward, turn_info, turn_done, executed_actions = self._execute_actions(env, [final_answer])
+        else:
+            acc_reward, turn_info, turn_done, executed_actions = self._execute_actions(env, valid_actions[:actions_left_before])
+
+        penalty = 0
+        if len(valid_actions) != len(env_input['actions']) or not valid_actions:
+            penalty = self.sys_config.es_manager.format_penalty
             
-            return acc_reward, turn_info, turn_done, executed_actions
+        status, history = self._log_env_state(status, history, env.render(), entry['max_actions_per_traj'], executed_actions, valid_actions, acc_reward, turn_done, turn_info, env_input)
+        
+        if status.num_actions >= entry['max_actions_per_traj'] and not turn_done:
+            status.truncated = True
+            status.terminated = True 
+            turn_done = True
 
-        def _log_env_state(status, history, cur_obs, max_actions_per_traj, executed_actions, all_actions, acc_reward, turn_done, turn_info, env_input):
-            obs = self._handle_mm_state(cur_obs)
-            status.num_actions += len(executed_actions)
-            status.rewards.append(acc_reward) # NOTE use turn-wise acc_reward
-            actions_left = max_actions_per_traj - status.num_actions # TODO 对于支持多个 action 连续输入的 env, 这里的计算逻辑要修改一下
-            if turn_done:
-                status.terminated = True # TODO check terminated definition in gymnasium
-                status.truncated = not turn_info.get('success', False)
-            history = self._update_cache_history(history, next_state=obs, actions_left=actions_left, num_actions_info={
-                'actions': executed_actions, 'reward': acc_reward, 'info': turn_info,
-                'llm_response': env_input['llm_response'], 'llm_raw_response': env_input['llm_raw_response']
-            })
-            # filter out invalid actions
-            # history = [content for content in history[:-1] if content['actions']] + [history[-1]]
-            return status, history
+        return env_id, status, history, penalty, turn_done
 
-        envs = self.envs
+    def step(self, all_env_inputs: List[Dict]):
+        """Step the environments."""
         env_outputs = []
 
-        for env_input in all_env_inputs:
-            acc_reward, turn_info, turn_done = 0, {}, False
-            entry = envs[env_input['env_id']]
-            env_id, env = entry['env_id'], entry['env']
-            actions_left_before = entry['max_actions_per_traj'] - entry['status'].num_actions
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = list(executor.map(self._step_env, all_env_inputs))
 
-            # execute actions in envs
-            valid_actions = self._extract_map_valid_actions(entry, env_input['actions'])
-            finally_answer = env_input.get('final_answer', None)
-            if finally_answer is not None and finally_answer != "":
-                acc_reward, turn_info, turn_done, executed_actions = _execute_actions(env, [finally_answer])
-            else:
-                acc_reward, turn_info, turn_done, executed_actions = _execute_actions(env, valid_actions[:actions_left_before])
-            if len(valid_actions) != len(env_input['actions']) or not valid_actions:
-                self.rollout_cache[env_id]["penalty"] += self.sys_config.es_manager.format_penalty
-                
-            status, history = _log_env_state(entry['status'], self.rollout_cache[env_id]['history'], entry['env'].render(), entry['max_actions_per_traj'], executed_actions, valid_actions, acc_reward, turn_done, turn_info, env_input)
-            entry['status'] = status
-            if entry['status'].num_actions >= entry['max_actions_per_traj'] and not turn_done:
-                entry['status'].truncated = True
-                entry['status'].terminated = True
-                turn_done = True
+        for env_id, status, history, penalty, turn_done in results:
+            self.envs[env_id]['status'] = status
             self.rollout_cache[env_id]['history'] = history
+            self.rollout_cache[env_id]["penalty"] += penalty
+            
             if not turn_done: # NOTE done environments are not sent for further llm generation (for efficiency)
                 env_outputs.append(self.rollout_cache[env_id])
 
@@ -229,6 +263,7 @@ class EnvStateManager:
         elif isinstance(next_state, BrowserOutputObservation): # 以后和 BrowserOutputObservation 的适配都在这里处理，方便统一控制。
             entry['state'] = str(next_state)
             entry['condensed_state'] = next_state.get_condensed_observation()
+            entry['goal'] = next_state.get_goal()
         else: # multimodal state
             entry['state'] = "<images>" * len(next_state) # TODO 这里应该是针对 qwen 多模的适配，可能还不通用。还要考虑多模态输入的适配
             entry['images'] = next_state

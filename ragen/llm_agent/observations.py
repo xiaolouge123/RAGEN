@@ -44,17 +44,16 @@ class BrowserOutputObservation:
         )
         ret += '--- Agent Observation ---\n'
         ret += self.get_agent_obs_text()
-        if self.task_goal:
-            ret = f'\n[Task Goal: {self.task_goal}]\n' + ret
         return ret
+    
+    def get_goal(self) -> str:
+        return f'\n[Task Goal: {self.task_goal}]\n'
     
     def get_condensed_observation(self) -> str:
         # 对齐 oh 里面处理的方式。
         ret = (
-            f'Current URL: {self.url}\nContent Omitted for saving space.'
+            f'Current URL: {self.url}. Content Omitted for saving space.'
         )
-        if self.task_goal:
-            ret = f'\n[Task Goal: {self.task_goal}]\n' + ret
         return ret
     
     def add_task_goal(self, task_goal: str):
