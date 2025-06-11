@@ -293,6 +293,13 @@ class ContextManager:
         ]
         prefix_lookup - from env_id to initial prompt
         """
+        max_response_length = self.config.actor_rollout_ref.rollout.response_length
+        max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
+        # a safe guard for max_model_len
+        if not max_model_len or max_model_len <= 0:
+            max_model_len = self.tokenizer.model_max_length
+        max_prompt_len = max_model_len - max_response_length
+
         llm_input_texts = []
         messages_list = [] # for api calling
         for env_output in env_outputs:
@@ -305,27 +312,30 @@ class ContextManager:
             env_tag = env_output["tag"]
 
             for idx, content in enumerate(env_output["history"]):
-                if idx == 0 and content.get("goal", None):
-                    messages[-1]["content"] += f"\n{content['goal']}" # 只在首轮次 user prompt 最后添加任务目标。
-                
-                messages[-1]["content"] += f"\nTurn {idx + 1}:\n"
                 if env_tag in ["WebBrowser"]:
-                    LENGTH_PROMPT = f"\nMax response length: {self.env_config_lookup[env_output['env_id']]['max_tokens']} words (tokens)."
+                    if idx == 0 and content.get("goal", None):
+                        messages[-1]["content"] += f"\n{content['goal']}" # 只在首轮次 user prompt 最后添加任务目标。
+                    if idx == 0:
+                        LENGTH_PROMPT = f"\nMax response length: {self.env_config_lookup[env_output['env_id']]['max_tokens']} words (tokens)."
+                        messages[-1]["content"] += LENGTH_PROMPT # 只在首轮次 user prompt 最后添加回复长度限制。format prompt 已经在配置文件中添加了。
+
+                    messages[-1]["content"] += f"\nTurn {idx + 1}:\n"
                     if "state" in content:
                         if idx + 1 < len(env_output["history"]):
                             # 说明这是最后一个轮次之前的 state， 只需要添加 condensed observation
                             messages[-1]["content"] += f"State:\n{content['condensed_state']}"
                         else:
                             messages[-1]["content"] += f"State:\n{content['state']}"
-                        if idx == 0:
-                            messages[-1]["content"] += LENGTH_PROMPT # 只在首轮次 user prompt 最后添加回复长度限制。format prompt 已经在配置文件中添加了。
+                        
                     if "llm_response" in content:
                         messages.append({"role": "assistant", "content": content["llm_response"]})
+                    
                     if "reward" in content and not (prepare_for_update and idx == len(env_output["history"]) - 1):
                         # when prepare for update, we do not add the reward from the n+1 turn to the trajectory
                         messages.append({"role": "user", "content": f"Reward:\n{content['reward']}\n"})
                 
                 else:
+                    messages[-1]["content"] += f"\nTurn {idx + 1}:\n"
                     # TODO 这里很奇怪额。如果 history 是多轮次的的，FORMAR_PROMPT 和 LENGTH_PROMPT 会在每个 turn 都重复，这明显没太大的必要。
                     if "state" in content:
                         FORMAT_PROMPT = "<think> [Your thoughts] </think> <answer> [your answer] </answer>" if self.config.agent_proxy.enable_think else "<answer> [your answer] </answer>"
@@ -340,6 +350,47 @@ class ContextManager:
 
             # NOTE: this assertion is important for loss mask computation        
             assert all(msg["role"] == "assistant" for msg in messages[2::2])
+            
+            # NOTE: hard code 强制 prompt 不要过程，截断只截断最后一轮次user 的 state 内容
+            # Truncate the prompt from the last user turn's state if it exceeds max_prompt_len
+            temp_input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
+            if len(temp_input_ids) > max_prompt_len:
+                last_user_idx = -1
+                # Find the last message from a user
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i]['role'] == 'user':
+                        last_user_idx = i
+                        break
+                
+                if last_user_idx != -1:
+                    original_content = messages[last_user_idx]['content']
+                    # The state information is expected to be at the end, after "State:\n".
+                    # We will truncate the content that follows this marker.
+                    split_marker = "State:\n"
+                    parts = original_content.rsplit(split_marker, 1)
+
+                    if len(parts) == 2:
+                        base_content, state_content = parts
+                        base_content += split_marker  # Restore the marker to the base part
+
+                        # Create a copy of messages to calculate the base prompt length without the state
+                        temp_messages = list(messages)
+                        temp_messages[last_user_idx] = {'role': 'user', 'content': base_content}
+
+                        # Calculate the length of the prompt without the state to determine remaining space
+                        base_prompt_ids = self.tokenizer.apply_chat_template(temp_messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
+                        remaining_len = max_prompt_len - len(base_prompt_ids)
+
+                        if remaining_len > 0:
+                            # Tokenize the state and truncate it from the beginning to keep the most recent info
+                            state_ids = self.tokenizer.encode(state_content)
+                            truncated_state_ids = state_ids[-remaining_len:]
+                            truncated_state_content = self.tokenizer.decode(truncated_state_ids, skip_special_tokens=True)
+                            # Reconstruct the final content for the last user message
+                            messages[last_user_idx]['content'] = base_content + truncated_state_content
+                        else:
+                            # If there's no space for the state, truncate it completely
+                            messages[last_user_idx]['content'] = base_content
 
             text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=False)
             if not prepare_for_update:
@@ -379,6 +430,7 @@ class ContextManager:
             "group_ids": np.array([env_output["group_id"] for env_output in env_outputs], dtype=object),
             "env_tags": np.array([env_output["tag"] for env_output in env_outputs], dtype=object), # 用来控制后续的 llm response 解析
             "messages_list": np.array(messages_list, dtype=object),
+            "lm_input_texts": np.array(llm_input_texts, dtype=object), # 用来debug 看日志的
         }
 
         if prepare_for_update:

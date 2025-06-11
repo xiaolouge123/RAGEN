@@ -46,13 +46,27 @@ class BrowserOutputObservation:
         ret += self.get_agent_obs_text()
         return ret
     
+    def update_error(self, error: str):
+        self.error = True
+        self.last_browser_action_error = error
+        self.last_browser_action = "<invalid_action>"
+
     def get_goal(self) -> str:
         return f'\n[Task Goal: {self.task_goal}]\n'
     
     def get_condensed_observation(self) -> str:
-        # 对齐 oh 里面处理的方式。
+
         ret = (
-            f'Current URL: {self.url}. Content Omitted for saving space.'
+            '**BrowserOutputObservation**\n'
+            f'URL: {self.url}\n'
+            f'Error: {self.error}\n'
+            f'Open pages: {self.open_pages_urls}\n'
+            f'Active page index: {self.active_page_index}\n'
+            f'Last browser action: {self.last_browser_action}\n'
+            f'Last browser action error: {self.last_browser_action_error}\n'
+            f'Focused element bid: {self.focused_element_bid}\n'
+            '--- Agent Observation ---\n'
+            f'[Content Omitted for saving space.]\n'
         )
         return ret
     

@@ -103,7 +103,7 @@ class Task:
     instruction: str
     action_tip: str
     ground_truth: str
-
+            
     def get_task_goal(self):
         if self.action_tip:
             return f"在{self.data_url}网站中，找到{self.instruction}，结果输入result.md文件，网站中寻找到目标数据的经验tips总结如下: {self.action_tip}"
@@ -280,6 +280,9 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
         Execute an action in the browser environment and return the observation.
         action_str: 可以是具体的 action 动作，也有可能是 外部传入的 最终答案， 会以这样的形式传入：<answer>{answer content}</answer>, 我们需要更具这个信息进行结果对比。
         """
+        if action_str == "<invalid_action>":
+            self.render_cache.update_error("Not a valid action.")
+            return self.render_cache, 0, False, {}
 
         if "<answer>" in action_str:
             answer = action_str.split("<answer>")[1].split("</answer>")[0]
@@ -297,6 +300,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                     response_id, obs = self.agent_side.recv()
                     if response_id == unique_request_id: # TODO 限制了同步串行行为
                         observation = BrowserOutputObservation(**format_browser_observation(obs))
+                        self.render_cache = observation
                         # TODO 具体每一轮次 action 的 reward 和 done 需要外部评估器评估，除了异常报错的问题
                         return observation, 0, False, {} # TODO 还有 reward, done, info 等额外信息需要添加。
         except Exception as e:
@@ -309,6 +313,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                 url='',
                 trigger_by_action='browse_interactive',
             )
+            self.render_cache = observation
             self.browser_retries += 1
             if self.browser_retries >= self.browser_retries_limit:
                 return observation, 0, True, {}
@@ -404,7 +409,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
             )
         self.agent_side.send(('RESET', None)) # reset the browser to blank page
         start_time = time.time()
-        reset_timeout = 30  # 设置超时时间，例如30秒
+        reset_timeout = 120  # 设置超时时间，例如120秒
         while True:
             if should_exit() or time.time() - start_time > reset_timeout:
                 logger.error(f"Timeout or exit signal received during reset after {reset_timeout} seconds.")
@@ -417,7 +422,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                         self.render_cache.add_task_goal(self.current_task.get_task_goal()) # reset env 后，第一次observation 添加 goal 信息
                         logger.info(f"Browser Reset done after {time.time() - start_time} seconds.")
                     except Exception as e:
-                        logger.error(f"Error when formatting browser observation: {e}")
+                        logger.error(f"Error in WebBrowserEnv.reset when formatting browser observation: {e}")
                         self.render_cache = BrowserOutputObservation(
                             content=str(e),
                             screenshot='',
@@ -439,9 +444,10 @@ if __name__ == '__main__':
     print('init obs: ', obs)
     print('init condensed obs: ', obs.get_condensed_observation())
 
-    obs, reward, done, info = env.step(action_str="goto('http://www.example.com/')")
+    obs, reward, done, info = env.step(action_str="goto('https://www.stats.gov.cn/')")
     print(f"after goto obs: {obs}") # TODO 研究一下获取的 obs [16] link '', clickable, url='https://www.chinabgao.com/kf/dialog_1.htm?arg=9007904&style=1' 怎么控制 url 是否出现。
     print(f"after goto condensed obs: {obs.get_condensed_observation()}")
+    print(f"render obs: {env.render()}")
     # with open('obs.txt', 'w') as f:
     #     f.write(str(obs))
     # print(reward)

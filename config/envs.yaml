@@ -94,8 +94,8 @@ custom_envs:
 
   WebBrowser:
     env_type: webbrowser
-    max_actions_per_traj: 50
-    max_tokens: 200
+    max_actions_per_traj: 10
+    max_tokens: 400
     env_config: null
     enable_world_info: True
     env_instruction: >
@@ -209,9 +209,9 @@ custom_envs:
         click('a51')
         click('48', button='middle', modifiers=['Shift'])
 
-      You must output the answer in the following format:<think>[Your thoughts]</think><actions>[Actions to take]</actions><answer>[Your answer]</answer> . <answer> tag is only required when you have finished the task and give out the final answer to the task goal and no more actions to take.
+      You must output your answer in the following format: `<think>{Your thoughts}</think><action>{Action to take}</action>` or `<think>{Your thoughts}</think><answer>{Your answer}</answer>`.
       Example:
-      <think>I need to click the news title "浙江桐庐的 10 大景点" to navigate to the news page and read the content</think><actions>click('a51')</actions>
+      <think>In order to get some information about the news title "浙江桐庐的 10 大景点", I need to click the news title "浙江桐庐的 10 大景点" to navigate to the new page and read the content</think><action>click('a51')</action>
       <think>I have read the whole revenue report and find that the total income of Department A is $20000000 in 2024</think><answer>The total income of Department A is $20000000 in 2024</answer>
 
   WebShop:

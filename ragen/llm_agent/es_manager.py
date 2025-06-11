@@ -11,6 +11,7 @@ import random
 import concurrent.futures
 import copy
 import numpy as np
+import time
 
 from ragen.env import REGISTERED_ENVS, REGISTERED_ENV_CONFIGS
 from ragen.utils import register_resolvers
@@ -60,18 +61,26 @@ class EnvStateManager:
     def _create_env_instance(self, args: tuple):
         """Helper function to create a single environment instance."""
         tag, group_id, env_id = args
-        cfg_template = self.sys_config.custom_envs[tag]
-        env_class = cfg_template.env_type
-        max_actions_per_traj = cfg_template.max_actions_per_traj
-        if cfg_template.env_config is None:
-            env_config = REGISTERED_ENV_CONFIGS[env_class]()
-        else:
-            env_config = REGISTERED_ENV_CONFIGS[env_class](**cfg_template.env_config)
-        env_obj = REGISTERED_ENVS[env_class](env_config)
-        print(f"Init env {env_id} of tag {tag}")
-        entry = {'tag': tag, 'group_id': group_id, 'env_id': env_id, 
-                'env': env_obj, 'config': env_config, 'status': EnvStatus(), 'max_actions_per_traj': max_actions_per_traj}
-        return entry
+        retries = 3
+        for attempt in range(retries):
+            try:
+                cfg_template = self.sys_config.custom_envs[tag]
+                env_class = cfg_template.env_type
+                max_actions_per_traj = cfg_template.max_actions_per_traj
+                if cfg_template.env_config is None:
+                    env_config = REGISTERED_ENV_CONFIGS[env_class]()
+                else:
+                    env_config = REGISTERED_ENV_CONFIGS[env_class](**cfg_template.env_config)
+                env_obj = REGISTERED_ENVS[env_class](env_config)
+                print(f"Init env {env_id} of tag {tag}")
+                entry = {'tag': tag, 'group_id': group_id, 'env_id': env_id, 
+                        'env': env_obj, 'config': env_config, 'status': EnvStatus(), 'max_actions_per_traj': max_actions_per_traj}
+                return entry
+            except Exception as e:
+                print(f"Error creating env {env_id} (tag: {tag}), attempt {attempt + 1}/{retries}: {e}")
+                if attempt + 1 >= retries:
+                    raise
+                time.sleep(1)
 
     def _init_env_instances(self, config):
         print("Init envs... env counts: ", sum(config.env_configs.n_groups)* self.group_size)
@@ -90,11 +99,33 @@ class EnvStateManager:
     def _reset_env(self, args):
         """Helper function to reset a single environment instance."""
         entry, seed = args
-        entry['env'].reset(seed=seed, mode=self.mode)
-        status = EnvStatus(seed=seed)
-        next_state = self._handle_mm_state(entry['env'].render())
-        return entry['env_id'], status, next_state
-
+        retries = 3
+        for attempt in range(retries):
+            try:
+                entry['env'].reset(seed=seed, mode=self.mode)
+                status = EnvStatus(seed=seed)
+                next_state = self._handle_mm_state(entry['env'].render())
+                return entry['env_id'], status, next_state
+            except Exception as e:
+                print(f"Error resetting env {entry['env_id']} (tag: {entry['tag']}), attempt {attempt + 1}/{retries}: {e}")
+                if attempt + 1 < retries:
+                    print(f"Recreating env {entry['env_id']} and retrying reset.")
+                    try:
+                        entry['env'].close()
+                    except Exception as close_e:
+                        print(f"Error closing failed env {entry['env_id']}: {close_e}")
+                    
+                    try:
+                        new_entry = self._create_env_instance((entry['tag'], entry['group_id'], entry['env_id']))
+                        self.envs[entry['env_id']] = new_entry
+                        entry = new_entry
+                    except Exception as recreate_e:
+                        print(f"Failed to recreate env {entry['env_id']}: {recreate_e}")
+                        # If recreation fails, we'll just wait and retry reset on the old env instance.
+                        time.sleep(1)
+                else:
+                    raise e
+            
     def reset(self, seed: Optional[int] = None):
         """
         Reset the environments and get initial observation
@@ -132,16 +163,55 @@ class EnvStateManager:
         self.rollout_cache = rollout_cache
         return rollout_cache
 
-    def _execute_actions(self, env, actions):
+    def _execute_actions(self, entry, actions):
+        env = entry['env']
         acc_reward, turn_info, turn_done = 0, {}, False
         executed_actions = []
-        for action in actions:
-            _, reward, done, info = env.step(action)
-            acc_reward += reward
-            turn_info.update(info) # NOTE: currently use last info for multi-action
-            executed_actions.append(action)
-            if done:
-                turn_done = True
+        retries = 3
+
+        actions_to_process = actions
+        is_invalid_action_case = False
+        if not actions:
+            actions_to_process = ["<invalid_action>"]
+            is_invalid_action_case = True
+
+        for action in actions_to_process:
+            for attempt in range(retries):
+                try:
+                    _, reward, done, info = env.step(action)
+                    acc_reward += reward
+                    turn_info.update(info)
+                    if not is_invalid_action_case:
+                        executed_actions.append(action)
+                    if done:
+                        turn_done = True
+                    break  # Success, break retry loop
+                except Exception as e:
+                    print(f"Error stepping env {entry['env_id']} (tag: {entry['tag']}), action '{action}', attempt {attempt + 1}/{retries}: {e}")
+                    if attempt + 1 < retries:
+                        print(f"Recreating env {entry['env_id']}.")
+                        try:
+                            env.close()
+                        except Exception as close_e:
+                            print(f"Error closing failed env {entry['env_id']} during step retry: {close_e}")
+                        try:
+                            new_entry = self._create_env_instance((entry['tag'], entry['group_id'], entry['env_id']))
+                            self.envs[entry['env_id']] = new_entry
+                            entry = new_entry
+                            env = new_entry['env']
+                            
+                            turn_info['error'] = f"Environment crashed on action '{action}' and was recreated. Aborting turn."
+                            turn_done = True
+                            break 
+                        except Exception as recreate_e:
+                            print(f"Failed to recreate env {entry['env_id']}: {recreate_e}")
+                            time.sleep(1) # wait before next retry on old env
+                    else:
+                        print(f"Failed to step env {entry['env_id']} after {retries} retries. Aborting actions for this turn.")
+                        turn_info['error'] = f"Failed to step after {retries} retries: {e}"
+                        turn_done = True
+            
+            if turn_done:
                 break
         
         return acc_reward, turn_info, turn_done, executed_actions
@@ -166,8 +236,6 @@ class EnvStateManager:
         """Helper function to step a single environment instance."""
         env_id = env_input['env_id']
         entry = self.envs[env_id]
-        env = entry['env']
-        
         # Deepcopy status and history to avoid race conditions
         status = EnvStatus(**vars(entry['status']))
         history = copy.deepcopy(self.rollout_cache[env_id]['history'])
@@ -178,15 +246,15 @@ class EnvStateManager:
         valid_actions = self._extract_map_valid_actions(entry, env_input['actions'])
         final_answer = env_input.get('final_answer', None)
         if final_answer is not None and final_answer != "":
-            acc_reward, turn_info, turn_done, executed_actions = self._execute_actions(env, [final_answer])
+            acc_reward, turn_info, turn_done, executed_actions = self._execute_actions(entry, [final_answer])
         else:
-            acc_reward, turn_info, turn_done, executed_actions = self._execute_actions(env, valid_actions[:actions_left_before])
+            acc_reward, turn_info, turn_done, executed_actions = self._execute_actions(entry, valid_actions[:actions_left_before])
 
         penalty = 0
         if len(valid_actions) != len(env_input['actions']) or not valid_actions:
             penalty = self.sys_config.es_manager.format_penalty
             
-        status, history = self._log_env_state(status, history, env.render(), entry['max_actions_per_traj'], executed_actions, valid_actions, acc_reward, turn_done, turn_info, env_input)
+        status, history = self._log_env_state(status, history, entry['env'].render(), entry['max_actions_per_traj'], executed_actions, valid_actions, acc_reward, turn_done, turn_info, env_input)
         
         if status.num_actions >= entry['max_actions_per_traj'] and not turn_done:
             status.truncated = True

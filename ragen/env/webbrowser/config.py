@@ -5,8 +5,8 @@ from typing import Tuple, Optional, Dict, List
 class WebBrowserEnvConfig:
     """Configuration for WebBrowserEnv environment"""
     # Dataset config
-    train_path: str = field(default="data/webbrowser/train.parquet")
-    val_path: str = field(default="data/webbrowser/val.parquet")
+    train_path: str = field(default="/rt-vepfs/zyc/workspaces/RAGEN/data/webbrowser/train.parquet")
+    val_path: str = field(default="/rt-vepfs/zyc/workspaces/RAGEN/data/webbrowser/val.parquet")
 
     # env settings
     max_steps: int = field(default=100)
