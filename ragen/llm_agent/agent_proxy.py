@@ -145,6 +145,16 @@ class LLMAgentProxy:
 		ctx_manager = self.val_ctx_manager if val else self.train_ctx_manager
 		env_outputs = es_manager.reset()
 
+		"""
+		# TODO 这里也是同步锁定了，考虑用异步流水线提升效率吧。
+		虽然verl 实现了 rollout 阶段的异步流水线，但是agent 这里需要多步交互，rollout 阶段存在切换，所以需要实现两层意义上的异步流水线：1. Env.step 异步并发，2. 上面generate_sequences 中 padded_lm_outputs = self.actor_wg.generate_sequences(padded_lm_inputs) 也要换成 self.async_rollout_manager.generate_sequences(gen_batch) 提升推理截断的异步流水线。
+		if not self.async_rollout_mode:
+			gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+		else:
+			self.async_rollout_manager.wake_up()
+			gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+			self.async_rollout_manager.sleep()
+		"""
 		for i in range(self.config.agent_proxy.max_turn):
 			print(f'[DEBUG] rollout turn {i}')
 			lm_inputs: DataProto = ctx_manager.get_lm_inputs(env_outputs, prepare_for_update=False) # 获取当前轮次的 prefill prompts
