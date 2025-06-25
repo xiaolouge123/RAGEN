@@ -1,3 +1,4 @@
+from typing import Dict, Any
 from dataclasses import dataclass, field
 
 from browsergym.utils.obs import flatten_axtree_to_str
@@ -25,7 +26,8 @@ class BrowserOutputObservation:
     last_browser_action: str = ''
     last_browser_action_error: str = ''
     focused_element_bid: str = ''
-    task_goal: str = None
+    task: Dict[str, Any] = field(default_factory=dict)
+    final_answer : str = ""
 
     @property
     def message(self) -> str:
@@ -52,7 +54,13 @@ class BrowserOutputObservation:
         self.last_browser_action = "<invalid_action>"
 
     def get_goal(self) -> str:
-        return f'\n[Task Goal: {self.task_goal}]\n'
+        return f'\n[Task Goal: {self.task.get("goal", "")}]\n'
+
+    def get_gt(self) -> str:
+        return self.task.get('ground_truth', '')
+    
+    def get_answer(self) -> str:
+        return self.final_answer
     
     def get_condensed_observation(self) -> str:
 
@@ -70,8 +78,9 @@ class BrowserOutputObservation:
         )
         return ret
     
-    def add_task_goal(self, task_goal: str):
-        self.task_goal = task_goal
+    def add_task(self, task: Dict[str, Any]):
+        # required fields: goal, ground_truth
+        self.task = task
 
     def get_agent_obs_text(self) -> str:
         """Get a concise text that will be shown to the agent."""

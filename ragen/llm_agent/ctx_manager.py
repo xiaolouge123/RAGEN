@@ -180,6 +180,13 @@ class ContextManager:
                 return "", [], ""
             else:
                 return match.group(1), [], match.group(2)
+        elif "<think>" in response:
+            thought_pattern = r'<think>(.*?)</think>'
+            match = re.search(thought_pattern, response, re.DOTALL)
+            if not match:
+                return "", [], ""
+            else:
+                return match.group(1), [], ""
         else:
             return "", [], ""
 
@@ -283,6 +290,91 @@ class ContextManager:
 
         return score_tensor
     
+    def get_eval_lm_inputs(self, env_outputs: List[Dict]) -> DataProto:
+        """
+        输入是最终获取的 env_outputs，
+        env_outputs - please see below example
+        [
+            {"env_id": 1, "history": [{"state": "###\n#x_#", "llm_response": "Response 1", "reward": 0.5, "goal": "Goal 1", "gt": "Ground Truth 1"}, {"state": "###\n#x_#"}]},
+            {"env_id": 2, "history": [{"state": "###\n#x_#"}]},
+            ...
+        ]
+        # 在 history 的第一个轮次还添加了 goal 和 gt 信息。在最后一轮还会有 final_answer (非空) 用于进行打分。 这里主要结果进行评价打分，会比下面的简单些。
+        """
+        # TODO 这个也可以塞到 env output 里面获取
+        eval_prompt = """请根据如下问题，标准答案，测试答案，评估测试答案的正确程度。
+请关注测试答案如下几方面：
+1. 是否充分回答了问题中的各个方面？
+2. 是否回答了正确的数值结果？
+3. 是否遵循了问题中要求的输出格式？
+输出得分 0 到 10 分。如果测试答案没有值，则输出 0 。
+
+<question>{question}</question>
+
+<ground_truth>{ground_truth}</ground_truth>
+
+<predication>{predication}</predication>
+
+请给出你的判断得分输出这样的格式： <score>[your score]</score>
+"""     
+        error_eval_prompt = """
+请直接输出：<score>0</score>
+"""
+        max_eval_response_length = self.config.llm_reward_model_api.response_length
+        max_eval_model_len = self.config.llm_reward_model_api.max_model_len
+        if not max_eval_model_len or max_eval_model_len <= 0:
+            max_eval_model_len = self.tokenizer.model_max_length
+        max_prompt_len = max_eval_model_len - max_eval_response_length
+
+        llm_input_texts = []
+        messages_list = []
+        for env_output in env_outputs:
+            # print(f"env_output: {env_output['history'][0]}")
+            assert "goal" in env_output['history'][0] and "gt" in env_output['history'][0], "首轮env output 没找到 goal 和 gt"
+            goal = env_output['history'][0]['goal']
+            gt = env_output['history'][0]['gt']
+            
+
+            final_answer = env_output['history'][-1]['final_answer'] if "final_answer" in env_output['history'][-1]  and env_output['history'][-1]['final_answer'] != "" else "没有找到问题答案。"
+
+            if gt == "" or goal == "":
+                print(f"首轮env output 没找到 goal 和 gt, 请检查 {env_output['history'][0]}")
+                messages = [
+                    {"role": "system", "content": f"You're a helpful assistant. "}, 
+                    {"role": "user", "content": error_eval_prompt}
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": f"You're a helpful assistant. "}, 
+                    {"role": "user", "content": eval_prompt.format(question=goal, ground_truth=gt, predication=final_answer)}
+                ]
+
+            text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            # 暂时不考虑 prompt 过长问题
+            llm_input_texts.append(text)
+            messages_list.append(messages)
+        
+        inputs = self.tokenizer(llm_input_texts, return_tensors="pt", padding=True, padding_side="left", truncation=False) 
+        input_ids, attention_mask = inputs.input_ids, inputs.attention_mask
+        position_ids = attention_mask.cumsum(dim=-1)
+
+        llm_inputs = DataProto()
+        llm_inputs.batch = TensorDict({
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }, batch_size=input_ids.shape[0])
+
+        llm_inputs.non_tensor_batch = {
+            "env_ids": np.array([env_output["env_id"] for env_output in env_outputs], dtype=object),
+            "group_ids": np.array([env_output["group_id"] for env_output in env_outputs], dtype=object),
+            "env_tags": np.array([env_output["tag"] for env_output in env_outputs], dtype=object), # 用来控制后续的 llm response 解析
+            "messages_list": np.array(messages_list, dtype=object),
+            "lm_input_texts": np.array(llm_input_texts, dtype=object), # 用来debug 看日志的
+        }
+        return llm_inputs
+
+    
     def get_lm_inputs(self, env_outputs: List[Dict], prepare_for_update: bool) -> DataProto:
         """
         env_outputs - please see below example
@@ -355,8 +447,9 @@ class ContextManager:
             # Truncate the prompt from the last user turn's state if it exceeds max_prompt_len
             temp_input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
             if len(temp_input_ids) > max_prompt_len:
+                print(f'[DEBUG] truncate prompt, temp_input_ids length: {len(temp_input_ids)}, max_prompt_len: {max_prompt_len}')
                 last_user_idx = -1
-                # Find the last message from a user
+                # Find the last message from a user，the last turn suppose to be the user turn
                 for i in range(len(messages) - 1, -1, -1):
                     if messages[i]['role'] == 'user':
                         last_user_idx = i
@@ -380,19 +473,35 @@ class ContextManager:
                         # Calculate the length of the prompt without the state to determine remaining space
                         base_prompt_ids = self.tokenizer.apply_chat_template(temp_messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
                         remaining_len = max_prompt_len - len(base_prompt_ids)
-
+                        print(f'[DEBUG] remaining_len: {remaining_len}, base_prompt_ids length: {len(base_prompt_ids)}')
                         if remaining_len > 0:
                             # Tokenize the state and truncate it from the beginning to keep the most recent info
-                            state_ids = self.tokenizer.encode(state_content)
-                            truncated_state_ids = state_ids[-remaining_len:]
-                            truncated_state_content = self.tokenizer.decode(truncated_state_ids, skip_special_tokens=True)
+                            cnt = 5
+                            while cnt > 0:
+                                state_ids = self.tokenizer.encode(state_content)
+                                truncated_state_ids = state_ids[-remaining_len:]
+                                print(f'[DEBUG] truncated_state_ids length: {len(truncated_state_ids)} in cnt: {cnt}')
+                                truncated_state_content = self.tokenizer.decode(truncated_state_ids, skip_special_tokens=True)
+                                truncated_state_content_ids = self.tokenizer.encode(truncated_state_content)
+                                if len(truncated_state_content_ids) <= remaining_len:
+                                    break
+                                state_content = truncated_state_content
+                                cnt -= 1
                             # Reconstruct the final content for the last user message
                             messages[last_user_idx]['content'] = base_content + truncated_state_content
                         else:
                             # If there's no space for the state, truncate it completely
+                            # TODO 这里也很有问题啊，如果前面内容太长，这里也很容易超长。 64K 训练很必要，或者截断前面的历史
                             messages[last_user_idx]['content'] = base_content
+                        tmp_input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
+                        print(f'[DEBUG] before truncate length: {len(temp_input_ids)} after truncate length: {len(tmp_input_ids)}')
+                else:
+                    print(f'[DEBUG] last_user_idx: {last_user_idx}, last turn in messages is not user turn')
 
             text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=False)
+            print(f'[DEBUG] tokenized temp_input_ids length : {len(temp_input_ids)} text length after: {len(text)}')
+            # print(f'[DEBUG] messages: {messages}')
+            # print(f'[DEBUG] text: {text}')
             if not prepare_for_update:
                 if self.config.agent_proxy.enable_think: # TODO 这里代码和配置文件耦合了，envs.yaml 配置文件中，对于输出的限定可能花样更多。 处理不好就有可能出错。
                     text += "<think>" # force the LLM to think before answering
@@ -406,7 +515,7 @@ class ContextManager:
         position_ids = attention_mask.cumsum(dim=-1)
         if prepare_for_update:
             scores = [[i['reward'] for i in env_output['history']] for env_output in env_outputs]
-            score_tensor, loss_mask, response_mask = get_masks_and_scores(input_ids, self.tokenizer, scores, use_turn_scores=self.config.agent_proxy.use_turn_scores, enable_response_mask=self.config.enable_response_mask)
+            score_tensor, loss_mask, response_mask = get_masks_and_scores(input_ids, self.tokenizer, scores, use_turn_scores=self.config.agent_proxy.use_turn_scores, enable_response_mask=self.config.enable_response_mask) # 这种 Step 级别的 reward 后面再想想到底怎么搞吧。
 
             normalized_score_tensor = score_tensor
             if not self.config.agent_proxy.use_turn_scores:
@@ -477,13 +586,46 @@ class ContextManager:
                 "llm_raw_response": response,
                 "llm_response": llm_response,
                 "actions": actions,
-                "final_answer": answer, # TODO final_answer应该在哪实现结果对比。
+                "final_answer": answer, # 这个最终 answer 带 <answer></answer> 标签
             })
         return env_inputs
 
     def formulate_rollouts(self, env_outputs: List[Dict]) -> DataProto:
         llm_inputs = self.get_lm_inputs(env_outputs, prepare_for_update=True)
         return llm_inputs
+    
+    def get_eval_score(self, lm_outputs: DataProto) -> List[float]:
+        """
+		grep the score between <score>...</score>
+		"""
+        def grep_score(text: str) -> float:
+            pattern = r'<score>(.*?)</score>'
+            score = re.search(pattern, text).group(1)
+            if score:
+                return float(score)
+            else:
+                print(f'[DEBUG] score not found in {text}')
+                return 0.0
+
+        responses = None
+        if lm_outputs.non_tensor_batch is not None and 'response_texts' in lm_outputs.non_tensor_batch.keys():
+            responses = lm_outputs.non_tensor_batch['response_texts']
+        assert responses is not None, "Responses are not found in the lm_outputs"
+        scores = [grep_score(text) for text in responses]
+        return scores
+    
+    def update_eval_score(self, rollouts: DataProto, eval_lm_outputs: DataProto, env_outputs: List[Dict]):
+        """
+        Update the reward tensor with the LLM reward scores.
+        """
+        scores = self.get_eval_score(eval_lm_outputs) # 对于每个轨迹最终输出得分
+        input_ids = rollouts.batch['input_ids']
+        score_tensor = torch.zeros_like(input_ids, dtype=torch.float32)
+        score_tensor[:, -1] = torch.tensor(scores, dtype=torch.float32)
+        score_tensor = score_tensor[:, 1:] # remove the first token
+        normalized_score_tensor = self._normalize_score_tensor(score_tensor, env_outputs)
+        rollouts.batch['llm_reward_scores'] = normalized_score_tensor
+        return rollouts
 
     
 

@@ -184,7 +184,8 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         self.agent_proxy = LLMAgentProxy(
             config=self.config,
             actor_rollout_wg=self.actor_rollout_wg,
-            tokenizer=self.tokenizer
+            tokenizer=self.tokenizer,
+            # llm_reward_model_wg=self.llm_reward_model_wg,
         )
     def _maybe_log_generations(self, inputs, outputs, scores, _type="val"):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""

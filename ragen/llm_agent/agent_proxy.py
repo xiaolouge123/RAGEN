@@ -6,10 +6,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from verl import DataProto
 import hydra
 import os
+import re
 from typing import List, Dict
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from .base_llm import ConcurrentLLM
-import time
 
 
 class VllmWrapperWg: # Thi is a developing class for eval and test
@@ -111,6 +111,50 @@ class ApiCallingWrapperWg:
         lm_outputs.meta_info = lm_inputs.meta_info
         
         return lm_outputs
+	
+
+class EvalApiCallingWrapperWg:
+    """Wrapper class for API-based LLM calls that fits into the VERL framework"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.llm_kwargs = config.generation_kwargs
+        model_info = config.api
+        self.llm = ConcurrentLLM(
+			provider=model_info.provider_name,
+            model_name=model_info.model_name,
+            max_concurrency=config.model_config.max_concurrency,
+			base_url=model_info.base_url,
+			api_key=model_info.api_key
+        )
+        
+        print(f'API-based LLM ({model_info.provider_name} - {model_info.model_name}) initialized')
+
+
+    def generate_sequences(self, lm_inputs: DataProto) -> DataProto:
+        """
+        Convert the input ids to text, make API calls to generate responses, 
+        and create a DataProto with the results.
+        """
+
+        messages_list = lm_inputs.non_tensor_batch['messages_list'].tolist()
+        results, failed_messages = self.llm.run_batch(
+            messages_list=messages_list,
+            **self.llm_kwargs
+        )
+        assert not failed_messages, f"Failed to generate responses for the following messages: {failed_messages}"
+
+        texts = [result["response"] for result in results]
+        print(f'[DEBUG] texts[0]: {texts[0]}')
+        lm_outputs = DataProto()
+        lm_outputs.non_tensor_batch = {
+			'response_texts': texts,
+			'env_ids': lm_inputs.non_tensor_batch['env_ids'],
+			'group_ids': lm_inputs.non_tensor_batch['group_ids']
+		} # this is a bit hard-coded to bypass the __init__ check in DataProto
+        lm_outputs.meta_info = lm_inputs.meta_info
+        
+        return lm_outputs
 
 class LLMAgentProxy:
 	"""
@@ -124,6 +168,7 @@ class LLMAgentProxy:
 		self.val_es_manager = EnvStateManager(config, mode="val")
 		self.actor_wg = actor_rollout_wg
 		self.tokenizer = tokenizer
+		self.llm_reward_model_wg = EvalApiCallingWrapperWg(config.llm_reward_model_api) # 用于 llm model based verify 计算
 
 	def generate_sequences(self, lm_inputs: DataProto):
 		# TODO: add kv cache both for the vllm wrapper here and for verl vllm.
@@ -138,6 +183,13 @@ class LLMAgentProxy:
 		else:
 			raise ValueError(f"Unsupported actor worker type: {type(self.actor_wg)}")
 
+		return lm_outputs
+
+	def eval_generate_sequences(self, lm_inputs: DataProto):
+		if isinstance(self.llm_reward_model_wg, EvalApiCallingWrapperWg):
+			lm_outputs = self.llm_reward_model_wg.generate_sequences(lm_inputs)
+		else:
+			raise ValueError(f"Unsupported llm reward model worker type: {type(self.llm_reward_model_wg)}")
 		return lm_outputs
 
 	def rollout(self, dataproto: DataProto, val=False):
@@ -159,16 +211,93 @@ class LLMAgentProxy:
 			print(f'[DEBUG] rollout turn {i}')
 			lm_inputs: DataProto = ctx_manager.get_lm_inputs(env_outputs, prepare_for_update=False) # 获取当前轮次的 prefill prompts
 			lm_inputs.meta_info = dataproto.meta_info # TODO: setup vllm early stop when max length is reached. make sure this can be done
-			print(f'[DEBUG] rollout turn {i} longest lm_inputs: {sorted(lm_inputs.non_tensor_batch["lm_input_texts"], key=len)[-1]}')
+			# print(f'[DEBUG] rollout turn {i} longest lm_inputs: {sorted(lm_inputs.non_tensor_batch["lm_input_texts"], key=len)[-1]}')
+			print(f'[DEBUG] rollout turn {i} lm_inputs[0]: {lm_inputs.non_tensor_batch["lm_input_texts"][0]}')
 			lm_outputs: DataProto = self.generate_sequences(lm_inputs)
 			env_inputs: List[Dict] = ctx_manager.get_env_inputs(lm_outputs)
+			# TODO: env 里面可以添加 env input 打点统计，统计，每个环境组的，解析正确率，执行步长，是否抵达 answer 输出，页面跳转轨迹等信息，辅助分析环境组内，模型执行的稳定性和行为表现。
 			env_outputs: List[Dict] = es_manager.step(env_inputs)
 			if len(env_outputs) == 0: # all finished
 				break
 		rollout_states = es_manager.get_rollout_states() 
 		rollouts = ctx_manager.formulate_rollouts(rollout_states)
 		# self.tokenizer.batch_decode(rollouts.batch['input_ids'], skip_special_tokens=False) # see all the trajectories
+		if self.llm_reward_model_wg:
+			# 对结果做奖励打分，score 作为 sequence level 的 score 放到最后
+			# TODO: 异步提效。
+			eval_lm_inputs: DataProto = ctx_manager.get_eval_lm_inputs(rollout_states)
+			eval_lm_outputs: DataProto = self.eval_generate_sequences(eval_lm_inputs)
+			rollouts = ctx_manager.update_eval_score(rollouts, eval_lm_outputs, rollout_states)
+
+		metrics, valid_action_count, invalid_action_count = self.get_stats_from_rollout_states(rollout_states)
+		print(f'[DEBUG] rollout_states metrics: {metrics}')
+		print(f'[DEBUG] valid_action_count: {valid_action_count}')
+		print(f'[DEBUG] invalid_action_count: {invalid_action_count}')
+		rollouts.meta_info["metrics"].update(metrics)
 		return rollouts
+	
+	def get_stats_from_rollout_states(self, rollout_states: List[Dict]):
+		"""
+		统计全部 rollout 轨迹指标
+		轨迹长度：mean，max, min
+		输出 answer 率
+		输出正确 action 数
+		输出错误 action 数
+		输出无法解析 action 数
+		rollout_states: [{
+			"env_id": self.env_id,
+            "history": self.history,
+            "group_id": self.group_id,
+            "tag": self.tag,
+            "penalty": 0, 
+            "metrics": env_metric,
+		}
+		]
+		"""
+		trajectory_lengths = []
+		reach_answer = []
+		correct_action = []
+		incorrect_action = []
+		unparseable_action = []
+		for rollout_state in rollout_states:
+			trajectory_lengths.append(len(rollout_state["history"]))
+			print(f'[DEBUG] rollout_state last history: {rollout_state["history"][-1]}')
+			if rollout_state["history"][-1].get("meta_info", {}).get("status", "") == "answer_output":
+				reach_answer.append(1)
+			else:
+				reach_answer.append(0)
+
+			for entry in rollout_state["history"]:
+				if entry.get('info', {}).get("meta_info", {}).get("status", "") == "action_output":
+					correct_action.append(entry.get('info', {}).get("meta_info", {}).get("valid_action", []))
+				else:
+					incorrect_action.append(entry.get('info', {}).get("meta_info", {}).get("invalid_action", []))
+				
+				if entry.get('info', {}).get("meta_info", {}).get("status", "") == "action_error":
+					unparseable_action.append(1)
+		print(f'[DEBUG] correct_action: {correct_action}')
+		print(f'[DEBUG] incorrect_action: {incorrect_action}')
+		print(f'[DEBUG] unparseable_action: {unparseable_action}')
+		valid_action_count, invalid_action_count = {}, {}
+		for action in correct_action:
+			for action_item in action:
+				valid_action_count[action_item] = valid_action_count.get(action_item, 0) + 1
+		for action in incorrect_action:
+			for action_item in action:
+				invalid_action_count[action_item] = invalid_action_count.get(action_item, 0) + 1
+
+		return {
+			"rollout/mean_trajectory_lengths": sum(trajectory_lengths) / len(trajectory_lengths),
+			"rollout/max_trajectory_lengths": max(trajectory_lengths),
+			"rollout/min_trajectory_lengths": min(trajectory_lengths),
+			"rollout/answer_ratio": sum(reach_answer) / len(reach_answer),
+			"rollout/answer_count": sum(reach_answer),
+			"rollout/correct_action_count": sum([len(action) for action in correct_action]),
+			"rollout/incorrect_action_count": sum([len(action) for action in incorrect_action]),
+			"rollout/unparseable_action_count": sum(unparseable_action),
+		}, valid_action_count, invalid_action_count
+
+
 
 @hydra.main(version_base=None, config_path="../../config", config_name="base")
 def main(config):

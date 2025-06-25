@@ -29,70 +29,26 @@ from ragen.env.webbrowser.config import WebBrowserEnvConfig
 from ragen.utils import all_seed
 from ragen.llm_agent.observations import BrowserOutputObservation
 
+ENABLE_CONTEXT_CACHE = True
+REDIS_URL = "redis://localhost:6380/1"
+TTL = 3600 # 1 hour
+CACHE_RESOURCE_TYPES = ["document", "stylesheet", "script", "image", "font", "xhr", "fetch"]
 
-# class WebPageCacheClient:
-#     """
-#     A Redis client for caching webpage observations.
-#     The cache key is the page URL, and the value is the observation result.
-#     """
-#     def __init__(self, host='localhost', port=6379, db=0, expiration_time=86400):
-#         """
-#         Initializes the Redis client.
-#         Args:
-#             host (str): Redis server host.
-#             port (int): Redis server port.
-#             db (int): Redis database number.
-#             expiration_time (int): Cache expiration time in seconds. Defaults to 24 hours.
-#         """
-#         try:
-#             # Add a timeout to avoid blocking forever if Redis is slow
-#             self.redis_client = redis.Redis(host=host, port=port, db=db, socket_connect_timeout=2)
-#             self.redis_client.ping()
-#             logger.info("Successfully connected to Redis for page caching.")
-#         except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
-#             logger.warning(f"Could not connect to Redis for page caching: {e}. Cache will be disabled.")
-#             self.redis_client = None
-#         self.expiration_time = expiration_time
+VALID_ACTIONS = ["goto", "go_back", "go_forward", "noop", "scroll", "fill", "select_option", "click", "dblclick", "hover", "press", "focus", "clear", "drag_and_drop", "upload_file"]
 
-#     def get(self, url: str) -> Optional[Dict]:
-#         """
-#         Retrieves a cached observation for a given URL.
-#         Args:
-#             url (str): The URL to retrieve from the cache.
-#         Returns:
-#             The cached observation dictionary, or None if not found or if Redis is unavailable.
-#         """
-#         if not self.redis_client:
-#             return None
-        
-#         try:
-#             cached_data = self.redis_client.get(url)
-#             if cached_data:
-#                 logger.info(f"Cache hit for URL: {url}")
-#                 return pickle.loads(cached_data)
-#             else:
-#                 logger.info(f"Cache miss for URL: {url}")
-#                 return None
-#         except Exception as e:
-#             logger.error(f"Error getting cache from Redis for {url}: {e}")
-#             return None
-
-#     def set(self, url: str, observation: Dict):
-#         """
-#         Caches an observation for a given URL.
-#         Args:
-#             url (str): The URL to use as the cache key.
-#             observation (dict): The observation object to cache.
-#         """
-#         if not self.redis_client:
-#             return
-        
-#         try:
-#             serialized_data = pickle.dumps(observation)
-#             self.redis_client.setex(url, self.expiration_time, serialized_data)
-#             logger.info(f"Cached observation for URL: {url}")
-#         except Exception as e:
-#             logger.error(f"Error setting cache to Redis for {url}: {e}")
+def grep_action_items(action_str: str):
+    # IMPORTANT: action_str 通过 \n 分割，所以需要处理 \n 的情况
+    action_items = action_str.split("\n")
+    valid_action, invalid_action = [], []
+    for action_item in action_items:
+        if len(action_item.strip()) == 0:
+            continue
+        action_name = action_item.strip().split("(")[0]
+        if action_name in VALID_ACTIONS:
+            valid_action.append(action_name)
+        else:
+            invalid_action.append(action_name)
+    return valid_action, invalid_action
 
 
 @dataclass
@@ -106,9 +62,9 @@ class Task:
             
     def get_task_goal(self):
         if self.action_tip:
-            return f"在{self.data_url}网站中，找到{self.instruction}，结果输入result.md文件，网站中寻找到目标数据的经验tips总结如下: {self.action_tip}"
+            return f"在{self.data_url}网站中，找到{self.instruction}，网站中寻找到目标数据的经验tips总结如下: {self.action_tip}"
         else:
-            return f"在{self.data_url}网站中，找到{self.instruction}，结果输入result.md文件"
+            return f"在{self.data_url}网站中，找到{self.instruction}"
 
 
 def format_browser_observation(obs: dict):
@@ -190,7 +146,9 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
             wait_for_user_message=False,
             headless=True,
             disable_env_checker=True,
-            tags_to_mark='all',
+            tags_to_mark='all', # TODO playwright context 缓存是输入参数记得实例化
+            enable_context_cache=ENABLE_CONTEXT_CACHE,
+            context_cache_kwargs={"redis_url": REDIS_URL, "ttl": TTL, "cacheable_resource_types": CACHE_RESOURCE_TYPES},
         )
         obs, info = env.reset() # 这个环境在 browsergym.core.env 中定义 BrowserEnv.reset
         self.render_cache = obs
@@ -234,13 +192,6 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                         continue
 
                     action = action_data['action']
-
-                    # Caching Logic for 'nav' action set: goto, go_back, go_forward
-                    url = None
-                    if "goto(" in action or "go_back(" in action or "go_forward(" in action:
-                        # TODO 这里的缓存实现要满足两层需要，一个是给 agent 看的 observation 层，这个比较好实现，只要缓存 url 和 obs 内容即可，但还有一层，需要 playwright 的浏览器环境也能继承这个缓存的 session，显然这个我还不知道咋怎么实现，所以先不考虑缓存的问题。
-                        pass 
-                    
                     obs, reward, terminated, truncated, info = env.step(action)
                     # obs 包含如下字段： chat_messages,goal,goal_object, open_pages_urls,open_pages_titles,active_page_index,url,screenshot,dom_object,axtree_object,extra_element_properties,focused_element_bid,last_action,last_action_error,elapsed_time
 
@@ -282,14 +233,24 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
         """
         if action_str == "<invalid_action>":
             self.render_cache.update_error("Not a valid action.")
-            return self.render_cache, 0, False, {}
+            return self.render_cache, 0, False, {"meta_info": {"status": "action_error", "msg": "Not a valid action."}}
 
         if "<answer>" in action_str:
             answer = action_str.split("<answer>")[1].split("</answer>")[0]
-            is_correct = self.check_answer(answer, self.current_task.ground_truth)
-            return None, 1 if is_correct else 0, True, {}
+            observation = BrowserOutputObservation(
+                content="Thank you for your answer.",
+                screenshot='',
+                error=False,
+                last_browser_action_error="",
+                url='',
+                trigger_by_action='browse_interactive',
+                final_answer=answer,
+            )
+            self.render_cache = observation
+            return observation, 0, True, {"meta_info": {"status": "answer_output", "msg": "answer turn."}} # 宣告任务结束
 
         unique_request_id = str(uuid.uuid4())
+        valid_action, invalid_action = grep_action_items(action_str)
         self.agent_side.send((unique_request_id, {'action': action_str}))
         start_time = time.time()
         try:
@@ -302,7 +263,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                         observation = BrowserOutputObservation(**format_browser_observation(obs))
                         self.render_cache = observation
                         # TODO 具体每一轮次 action 的 reward 和 done 需要外部评估器评估，除了异常报错的问题
-                        return observation, 0, False, {} # TODO 还有 reward, done, info 等额外信息需要添加。
+                        return observation, 0, False, {"meta_info": {"status": "action_output", "msg": "action turn", "valid_action": valid_action, "invalid_action": invalid_action}} # TODO 还有 reward, done, info 等额外信息需要添加。
         except Exception as e:
             logger.error(f'Encountered an error when executing browser action: {e}')
             observation = BrowserOutputObservation(
@@ -314,14 +275,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                 trigger_by_action='browse_interactive',
             )
             self.render_cache = observation
-            self.browser_retries += 1
-            if self.browser_retries >= self.browser_retries_limit:
-                return observation, 0, True, {}
-            return observation, 0, False, {} # TODO 当出现异常报错的时候，是否可以放心评判，rewar= 0 和 done=Ture
-        
-    def check_answer(self, answer: str, ground_truth: str) -> bool:
-        # TODO fake verifier 实现
-        return True
+            return observation, 0, False, {"meta_info": {"status": "exception", "msg": "action turn", "valid_action": valid_action, "invalid_action": invalid_action}} # TODO 当出现异常报错的时候，是否可以放心评判，rewar= 0 和 done=Ture
                     
 
     def check_alive(self, timeout: float = 60):
@@ -392,6 +346,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
         )
     
     def render(self):
+        # 持续更新当前 observation
         return self.render_cache
 
     def reset(self, seed: Optional[int] = None, **kwargs: any) -> Any:
@@ -419,7 +374,10 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                 if response_id == 'RESET_DONE':
                     try:
                         self.render_cache = BrowserOutputObservation(**format_browser_observation(obs))
-                        self.render_cache.add_task_goal(self.current_task.get_task_goal()) # reset env 后，第一次observation 添加 goal 信息
+                        self.render_cache.add_task({
+                            'goal': self.current_task.get_task_goal(),
+                            'ground_truth': self.current_task.ground_truth,
+                        }) # reset env 后，第一次observation 添加 goal, ground_truth 等相关信息
                         logger.info(f"Browser Reset done after {time.time() - start_time} seconds.")
                     except Exception as e:
                         logger.error(f"Error in WebBrowserEnv.reset when formatting browser observation: {e}")
@@ -431,7 +389,10 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                             url='',
                             trigger_by_action='browse_interactive',
                         )
-                        self.render_cache.add_task_goal(self.current_task.get_task_goal()) # reset env 后，第一次observation 添加 goal 信息
+                        self.render_cache.add_task({
+                            'goal': self.current_task.get_task_goal(),
+                            'ground_truth': self.current_task.ground_truth,
+                        }) # reset env 后，第一次observation 添加 goal, ground_truth 等相关信息
                     break
             time.sleep(0.1) # 减少 sleep 时间以便更快响应
         

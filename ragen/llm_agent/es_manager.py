@@ -87,6 +87,8 @@ class EnvActor:
             entry['state'] = str(next_state)
             entry['condensed_state'] = next_state.get_condensed_observation()
             entry['goal'] = next_state.get_goal()
+            entry['gt'] = next_state.get_gt()
+            entry['final_answer'] = next_state.get_answer()
         else:
             entry['state'] = "<images>" * len(next_state)
             entry['images'] = next_state
@@ -158,7 +160,8 @@ class EnvActor:
         final_answer = env_input.get('final_answer', None)
 
         if final_answer is not None and final_answer != "":
-            acc_reward, turn_info, turn_done, executed_actions = self._execute_actions([final_answer])
+            # 已经输出答案了，就不用再执行了，但是还是要 env 记录下 answer 结果到 history 中。已经走到输出结果的阶段了。
+            acc_reward, turn_info, turn_done, executed_actions = self._execute_actions([final_answer])  # 这个最终 answer 带 <answer></answer> 标签
         else:
             acc_reward, turn_info, turn_done, executed_actions = self._execute_actions(valid_actions[:actions_left_before])
         
@@ -196,9 +199,12 @@ class EnvActor:
         custom_metric = {}
         TURN_LVL_METRICS = ['action_is_effective', 'action_is_valid', 'end_of_page']
 
+        exclude_key = ['meta_info']
+
         for turn in self.history:
             for k, v in turn.get('info', {}).items():
                 if k == 'success': continue
+                if k in exclude_key: continue
                 if k not in custom_metric: custom_metric[k] = []
                 custom_metric[k].append(float(v))
 

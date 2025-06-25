@@ -27,6 +27,15 @@ class DummyRewardManager():
     def __call__(self, data: DataProto, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
 
+        # 优先使用 llm 评估结果
+        if 'llm_reward_scores' in data.batch.keys():
+            if return_dict:
+                return {
+                    "reward_tensor": data.batch['llm_reward_scores'],
+                }
+            else:
+                return data.batch['llm_reward_scores']
+
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if 'rm_scores' in data.batch.keys():
             if return_dict:
@@ -239,11 +248,7 @@ class TaskRunner:
         }
         if config.actor_rollout_ref.actor.use_ref:
             mapping[Role.RefPolicy] = global_pool_id
-        # mapping = {
-        #     Role.ActorRollout: global_pool_id,
-        #     Role.Critic: global_pool_id,
-        #     Role.RefPolicy: global_pool_id,
-        # }
+
 
         # we should adopt a multi-source reward function here
         # - for rule-based rm, we directly call a reward score

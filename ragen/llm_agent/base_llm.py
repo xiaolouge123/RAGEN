@@ -50,6 +50,27 @@ class OpenAIProvider(LLMProvider):
             content=response.choices[0].message.content,
             model_name=response.model
         )
+    
+class LocalOpenAIProvider(LLMProvider):
+    """Local OpenAI API provider implementation"""
+    
+    def __init__(self, model_name: str = "gpt-4o", base_url: str = None, api_key: str = None):
+        self.model_name = model_name
+        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+
+    async def generate(self, messages: List[Dict[str, str]], **kwargs) -> LLMResponse:
+        response = await self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            **kwargs
+        )
+        if response.choices[0].finish_reason in ['length', 'content_filter']:
+            raise ValueError("Content filtered or length exceeded")
+        return LLMResponse(
+            content=response.choices[0].message.content,
+            model_name=response.model
+        )
+
 
 class DeepSeekProvider(LLMProvider):
     """DeepSeek API provider implementation"""
@@ -146,7 +167,7 @@ class ConcurrentLLM:
     """Unified concurrent interface for multiple LLM providers"""
     
     def __init__(self, provider: Union[str, LLMProvider], model_name: Optional[str] = None, 
-                api_key: Optional[str] = None, max_concurrency: int = 4):
+                api_key: Optional[str] = None, max_concurrency: int = 4, base_url: Optional[str] = None):
         """
         Initialize the concurrent LLM client.
         
@@ -167,6 +188,8 @@ class ConcurrentLLM:
                 self.provider = AnthropicProvider(model_name or "claude-3-7-sonnet-20250219", api_key)
             elif provider.lower() == "together":
                 self.provider = TogetherProvider(model_name or "meta-llama/Llama-3-70b-chat-hf", api_key)
+            elif provider.lower() == "local_openai":
+                self.provider = LocalOpenAIProvider(model_name or "gpt-4o", base_url=base_url, api_key=api_key)
             else:
                 raise ValueError(f"Unknown provider: {provider}")
         
@@ -253,7 +276,8 @@ class ConcurrentLLM:
 if __name__ == "__main__":
     # llm = ConcurrentLLM(provider="openai", model_name="gpt-4o")
     # llm = ConcurrentLLM(provider="anthropic", model_name="claude-3-5-sonnet-20240620")
-    llm = ConcurrentLLM(provider="together", model_name="Qwen/Qwen2.5-7B-Instruct-Turbo")
+    # llm = ConcurrentLLM(provider="together", model_name="Qwen/Qwen2.5-7B-Instruct-Turbo")
+    llm = ConcurrentLLM(provider="local_openai", model_name="qwen2.5-7b-instruct", base_url="http://0.0.0.0:8989/v1", api_key="sk-adfda1212-sdfasf9v-dfafdaq")
     messages = [
         [{"role": "user", "content": "what is 2+2?"}],
         [{"role": "user", "content": "what is 2+3?"}],
@@ -274,3 +298,6 @@ if __name__ == "__main__":
     ]
     response = llm.run_batch(messages, max_tokens=100)
     print(f"final response: {response}")
+    # for messages in messages:
+    #     response = asyncio.run(llm.generate(messages, max_tokens=100))
+    #     print(f"final response: {response}")
