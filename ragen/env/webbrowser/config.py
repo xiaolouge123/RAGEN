@@ -4,6 +4,7 @@ from typing import Tuple, Optional, Dict, List
 @dataclass
 class WebBrowserEnvConfig:
     """Configuration for WebBrowserEnv environment"""
+    mode: str = field(default="train")
     # Dataset config
     train_path: str = field(default="/rt-vepfs/zyc/workspaces/RAGEN/data/webbrowser/train.parquet")
     val_path: str = field(default="/rt-vepfs/zyc/workspaces/RAGEN/data/webbrowser/val.parquet")

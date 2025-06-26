@@ -55,6 +55,7 @@ class EnvActor:
                     env_config = REGISTERED_ENV_CONFIGS[env_class]()
                 else:
                     env_config = REGISTERED_ENV_CONFIGS[env_class](**cfg_template.env_config)
+                env_config.mode = self.mode
                 self.env = REGISTERED_ENVS[env_class](env_config)
                 print(f"Init env {self.env_id} of tag {self.tag} in actor.")
                 return
@@ -302,6 +303,7 @@ class EnvStateManager:
         else:
             seed = 123
         seeds = _expand_seed(seed)
+        print(f"[DEBUG] expand seed: {seeds}")
 
         # Reset all environment actors in parallel
         print("Resetting all environment actors...")

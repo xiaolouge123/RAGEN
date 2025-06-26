@@ -33,6 +33,22 @@ ENABLE_CONTEXT_CACHE = True
 REDIS_URL = "redis://localhost:6380/1"
 TTL = 3600 # 1 hour
 CACHE_RESOURCE_TYPES = ["document", "stylesheet", "script", "image", "font", "xhr", "fetch"]
+RESOURCE_FILTER_KWARGS = {
+                    'resource_filter_config': {
+                        'block_images': True,
+                        'allow_essential_images': True,
+                        'block_videos': True,           # 阻止视频
+                        'block_ads': True,              # 阻止广告
+                        'block_analytics': True,        # 阻止分析脚本
+                        'block_fonts': False,           # 保留字体以免影响显示
+                        'custom_url_patterns': [        # 自定义阻止模式
+                            r'.*\.gif$',                # 阻止GIF动图
+                            r'.*banner.*',              # 阻止横幅
+                            r'.*tracking.*',            # 阻止跟踪
+                        ]
+                    }
+                }
+
 
 VALID_ACTIONS = ["goto", "go_back", "go_forward", "noop", "scroll", "fill", "select_option", "click", "dblclick", "hover", "press", "focus", "clear", "drag_and_drop", "upload_file"]
 
@@ -92,10 +108,10 @@ def format_browser_observation(obs: dict):
 class WebBrowserEnv(BaseLanguageBasedEnv):
     def __init__(self, config: Optional[WebBrowserEnvConfig] = None, **kwargs: any) -> None:
         super().__init__()
+        self.mode = config.mode if config is not None else "train"
         self.html_text_converter = self.get_html_text_converter()
         self.config = config if config is not None else WebBrowserEnvConfig()
-        self.train_data = datasets.load_dataset("parquet", data_files=self.config.train_path)
-        self.val_data = datasets.load_dataset("parquet", data_files=self.config.val_path)
+        self.data = datasets.load_dataset("parquet", data_files=self.config.train_path) if self.mode == "train" else datasets.load_dataset("parquet", data_files=self.config.val_path)
         self.browser_retries_limit = getattr(self.config, "browser_retries_limit", 3)
 
         # Initialize browser environment process
@@ -139,16 +155,16 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
             raise BrowserInitException('Failed to start browser environment.')
 
     def browser_process(self):
-        # cache_client = WebPageCacheClient()
         env = gym.make(
             'browsergym/openended',
-            task_kwargs={'start_url': 'about:blank', 'goal': 'PLACEHOLDER_GOAL'},
+            task_kwargs={'start_url': 'about:blank', 'goal': 'PLACEHOLDER_GOAL'}, # 永远入口页面都是空白页，reset 后也是空白页。
             wait_for_user_message=False,
             headless=True,
             disable_env_checker=True,
             tags_to_mark='all', # TODO playwright context 缓存是输入参数记得实例化
             enable_context_cache=ENABLE_CONTEXT_CACHE,
             context_cache_kwargs={"redis_url": REDIS_URL, "ttl": TTL, "cacheable_resource_types": CACHE_RESOURCE_TYPES},
+            resource_filter_kwargs=RESOURCE_FILTER_KWARGS,
         )
         obs, info = env.reset() # 这个环境在 browsergym.core.env 中定义 BrowserEnv.reset
         self.render_cache = obs
@@ -232,7 +248,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
         action_str: 可以是具体的 action 动作，也有可能是 外部传入的 最终答案， 会以这样的形式传入：<answer>{answer content}</answer>, 我们需要更具这个信息进行结果对比。
         """
         if action_str == "<invalid_action>":
-            self.render_cache.update_error("Not a valid action.")
+            self.render_cache.update_error("Not a valid action. Stay in the same page.")
             return self.render_cache, 0, False, {"meta_info": {"status": "action_error", "msg": "Not a valid action."}}
 
         if "<answer>" in action_str:
@@ -265,7 +281,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                         # TODO 具体每一轮次 action 的 reward 和 done 需要外部评估器评估，除了异常报错的问题
                         return observation, 0, False, {"meta_info": {"status": "action_output", "msg": "action turn", "valid_action": valid_action, "invalid_action": invalid_action}} # TODO 还有 reward, done, info 等额外信息需要添加。
         except Exception as e:
-            logger.error(f'Encountered an error when executing browser action: {e}')
+            logger.error(f'Encountered an error when executing browser action: {e}, input action: {action_str}')
             observation = BrowserOutputObservation(
                 content=str(e),
                 screenshot='',
@@ -351,8 +367,9 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
 
     def reset(self, seed: Optional[int] = None, **kwargs: any) -> Any:
         with all_seed(seed):
-            self.current_task_idx = random.randint(0, len(self.train_data) - 1)
-        task = self.train_data['train'][self.current_task_idx]
+            self.current_task_idx = random.randint(0, len(self.data['train']) - 1)
+        task = self.data['train'][self.current_task_idx]
+        logger.info(f"Resetting browser env with seed: {seed}, task_id: {self.current_task_idx}")
         # print(f"current_task_idx: {self.current_task_idx} task: {task}")
         self.current_task = Task(
             task_idx=self.current_task_idx, 

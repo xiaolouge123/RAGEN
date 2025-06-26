@@ -193,6 +193,7 @@ class LLMAgentProxy:
 		return lm_outputs
 
 	def rollout(self, dataproto: DataProto, val=False):
+		print(f'[DEBUG] Start Rollout.')
 		es_manager = self.val_es_manager if val else self.train_es_manager
 		ctx_manager = self.val_ctx_manager if val else self.train_ctx_manager
 		env_outputs = es_manager.reset()
@@ -214,8 +215,17 @@ class LLMAgentProxy:
 			# print(f'[DEBUG] rollout turn {i} longest lm_inputs: {sorted(lm_inputs.non_tensor_batch["lm_input_texts"], key=len)[-1]}')
 			print(f'[DEBUG] rollout turn {i} lm_inputs[0]: {lm_inputs.non_tensor_batch["lm_input_texts"][0]}')
 			lm_outputs: DataProto = self.generate_sequences(lm_inputs)
+
+			if lm_outputs.batch is not None and 'responses' in lm_outputs.batch.keys():
+				responses = self.tokenizer.batch_decode(
+					lm_outputs.batch['responses'], 
+					skip_special_tokens=True
+				)
+			else: # dataproto has textual responses
+				responses = lm_outputs.non_tensor_batch['response_texts']
+			print(f'[DEBUG] rollout turn {i} responses[0]: {responses[0]}')
+			
 			env_inputs: List[Dict] = ctx_manager.get_env_inputs(lm_outputs)
-			# TODO: env 里面可以添加 env input 打点统计，统计，每个环境组的，解析正确率，执行步长，是否抵达 answer 输出，页面跳转轨迹等信息，辅助分析环境组内，模型执行的稳定性和行为表现。
 			env_outputs: List[Dict] = es_manager.step(env_inputs)
 			if len(env_outputs) == 0: # all finished
 				break
@@ -259,9 +269,10 @@ class LLMAgentProxy:
 		correct_action = []
 		incorrect_action = []
 		unparseable_action = []
+		print(f'[DEBUG] rollout_states[0] last history: {rollout_states[0]["history"][-1]}')
 		for rollout_state in rollout_states:
 			trajectory_lengths.append(len(rollout_state["history"]))
-			print(f'[DEBUG] rollout_state last history: {rollout_state["history"][-1]}')
+			
 			if rollout_state["history"][-1].get("meta_info", {}).get("status", "") == "answer_output":
 				reach_answer.append(1)
 			else:
@@ -269,10 +280,11 @@ class LLMAgentProxy:
 
 			for entry in rollout_state["history"]:
 				if entry.get('info', {}).get("meta_info", {}).get("status", "") == "action_output":
-					correct_action.append(entry.get('info', {}).get("meta_info", {}).get("valid_action", []))
+					if entry.get('info', {}).get("meta_info", {}).get("valid_action", None):
+						correct_action.append(entry.get('info', {}).get("meta_info", {}).get("valid_action", []) )
 				else:
-					incorrect_action.append(entry.get('info', {}).get("meta_info", {}).get("invalid_action", []))
-				
+					if entry.get('info', {}).get("meta_info", {}).get("invalid_action", None):
+						incorrect_action.append(entry.get('info', {}).get("meta_info", {}).get("invalid_action", []))
 				if entry.get('info', {}).get("meta_info", {}).get("status", "") == "action_error":
 					unparseable_action.append(1)
 		print(f'[DEBUG] correct_action: {correct_action}')
