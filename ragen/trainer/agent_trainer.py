@@ -185,7 +185,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             config=self.config,
             actor_rollout_wg=self.actor_rollout_wg,
             tokenizer=self.tokenizer,
-            # llm_reward_model_wg=self.llm_reward_model_wg,
+            async_rollout_manager=self.async_rollout_manager if self.async_rollout_mode else None,
         )
     def _maybe_log_generations(self, inputs, outputs, scores, _type="val"):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -412,7 +412,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
-    def fit(self):
+    async def fit(self):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC
@@ -512,7 +512,10 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             with _timer("step", timing_raw):
                 # generate a batch
                 with _timer("gen", timing_raw):
-                    batch = self.agent_proxy.rollout(batch, val=False)
+                    if self.config.actor_rollout_ref.rollout.mode == "async":
+                        batch = await self.agent_proxy.async_rollout(batch, val=False)
+                    else:
+                        batch = self.agent_proxy.rollout(batch, val=False)
                     batch, metrics = _filter_rollout(batch)
                     metrics.update({"train/" + key: value for key, value in batch.meta_info["metrics"].items()})
 

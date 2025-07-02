@@ -185,6 +185,7 @@ class ActorRolloutRefWorker(Worker):
             "pad_token_id": self.tokenizer.pad_token_id,
         }
         override_config_kwargs.update(override_model_config)
+        # print(f"[DEBUG] actor_model_config: {actor_model_config}, override_config_kwargs: {override_config_kwargs}")
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")

@@ -14,6 +14,19 @@ import numpy as np
 from ragen.utils import register_resolvers
 register_resolvers()
 import sys
+import asyncio
+
+ray.init(
+    runtime_env={
+        "env_vars": {
+            "TOKENIZERS_PARALLELISM": "true",
+            "NCCL_DEBUG": "WARN",
+            "VLLM_LOGGING_LEVEL": "WARN",
+            "VLLM_USE_V1": "1",
+        }
+    }
+)
+
 
 class DummyRewardManager():
     """The reward manager.
@@ -227,10 +240,17 @@ class TaskRunner:
         #     Role.Critic: ray.remote(CriticWorker),
         #     Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
         # }
-        role_worker_mapping = {
-            Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
-            Role.Critic: ray.remote(CriticWorker),
-        }
+        if config.actor_rollout_ref.rollout.mode == "async":
+            from ragen.workers.fsdp_workers import AsyncActorRolloutRefWorker
+            role_worker_mapping = {
+                Role.ActorRollout: ray.remote(AsyncActorRolloutRefWorker),
+                Role.Critic: ray.remote(CriticWorker),
+            }
+        else:
+            role_worker_mapping = {
+                Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
+                Role.Critic: ray.remote(CriticWorker),
+            }
         if config.actor_rollout_ref.actor.use_ref:
             print("[DEBUG] using ref policy")
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
@@ -300,7 +320,11 @@ class TaskRunner:
         )
         trainer.init_workers()
         trainer.init_agent_proxy()
-        trainer.fit()
+        if config.actor_rollout_ref.rollout.mode == "async":
+            print("[DEBUG] using async rollout for training")
+            asyncio.run(trainer.fit())
+        else:
+            trainer.fit()
 
 
 if __name__ == '__main__':

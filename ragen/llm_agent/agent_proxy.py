@@ -4,12 +4,17 @@ from vllm import LLM, SamplingParams
 from verl.single_controller.ray.base import RayWorkerGroup
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from verl import DataProto
+import asyncio
+import concurrent.futures
 import hydra
 import os
 import re
-from typing import List, Dict
+import time
+import numpy as np
+from typing import List, Dict, Any
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from .base_llm import ConcurrentLLM
+from openai.types.chat.chat_completion import ChatCompletion
 
 
 class VllmWrapperWg: # Thi is a developing class for eval and test
@@ -118,7 +123,7 @@ class EvalApiCallingWrapperWg:
     
     def __init__(self, config):
         self.config = config
-        self.llm_kwargs = config.generation_kwargs
+        self.llm_kwargs = config.generation_kwargs # go to config llm_reward_model_api.generation_kwargs
         model_info = config.api
         self.llm = ConcurrentLLM(
 			provider=model_info.provider_name,
@@ -156,11 +161,59 @@ class EvalApiCallingWrapperWg:
         
         return lm_outputs
 
+    async def async_generate_sequences(self, lm_inputs: DataProto, mock: bool= False ) -> DataProto:
+        """
+        Async version of generate_sequences
+        """
+        messages_list = lm_inputs.non_tensor_batch['messages_list'].tolist()
+        if mock:
+            lm_outputs = DataProto()
+            lm_outputs.non_tensor_batch = {
+                'response_texts': ["<score>0.0</score>"] * len(messages_list),
+                'env_ids': lm_inputs.non_tensor_batch['env_ids'],
+                'group_ids': lm_inputs.non_tensor_batch['group_ids']
+                } # this is a bit hard-coded to bypass the __init__ check in DataProto
+            lm_outputs.meta_info = lm_inputs.meta_info
+
+            return lm_outputs
+        
+        # 检测是否在事件循环中，如果是则使用线程池执行同步方法
+        try:
+            loop = asyncio.get_running_loop()
+            # 在事件循环中，使用线程池执行同步的 run_batch
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    self.llm.run_batch,
+                    messages_list=messages_list,
+                    **self.llm_kwargs
+                )
+                results, failed_messages = future.result()
+        except RuntimeError:
+            # 没有事件循环，直接调用
+            results, failed_messages = self.llm.run_batch(
+                messages_list=messages_list,
+                **self.llm_kwargs
+            )
+            
+        assert not failed_messages, f"Failed to generate responses for the following messages: {failed_messages}"
+
+        texts = [result["response"] for result in results]
+        print(f'[DEBUG] texts[0]: {texts[0]}')
+        lm_outputs = DataProto()
+        lm_outputs.non_tensor_batch = {
+			'response_texts': texts,
+			'env_ids': lm_inputs.non_tensor_batch['env_ids'],
+			'group_ids': lm_inputs.non_tensor_batch['group_ids']
+		} # this is a bit hard-coded to bypass the __init__ check in DataProto
+        lm_outputs.meta_info = lm_inputs.meta_info
+        
+        return lm_outputs
+
 class LLMAgentProxy:
 	"""
 	The proxy means the llm agent is trying to generate some rollout **at this time**, **at this model state**, **at this env state from the env config**
 	"""
-	def __init__(self, config, actor_rollout_wg, tokenizer):
+	def __init__(self, config, actor_rollout_wg, tokenizer, async_rollout_manager=None):
 		self.config = config
 		self.train_ctx_manager = ContextManager(config, tokenizer, mode="train")
 		self.train_es_manager = EnvStateManager(config, mode="train")
@@ -169,6 +222,7 @@ class LLMAgentProxy:
 		self.actor_wg = actor_rollout_wg
 		self.tokenizer = tokenizer
 		self.llm_reward_model_wg = EvalApiCallingWrapperWg(config.llm_reward_model_api) # 用于 llm model based verify 计算
+		self.async_rollout_manager = async_rollout_manager # 用于异步 rollout
 
 	def generate_sequences(self, lm_inputs: DataProto):
 		# TODO: add kv cache both for the vllm wrapper here and for verl vllm.
@@ -185,29 +239,123 @@ class LLMAgentProxy:
 
 		return lm_outputs
 
+	async def async_eval_generate_sequences(self, lm_inputs: DataProto):
+		if isinstance(self.llm_reward_model_wg, EvalApiCallingWrapperWg):
+			lm_outputs = await self.llm_reward_model_wg.async_generate_sequences(lm_inputs, mock=True)
+		else:
+			raise ValueError(f"Unsupported llm reward model worker type: {type(self.llm_reward_model_wg)}")
+		return lm_outputs
+
 	def eval_generate_sequences(self, lm_inputs: DataProto):
 		if isinstance(self.llm_reward_model_wg, EvalApiCallingWrapperWg):
 			lm_outputs = self.llm_reward_model_wg.generate_sequences(lm_inputs)
 		else:
 			raise ValueError(f"Unsupported llm reward model worker type: {type(self.llm_reward_model_wg)}")
 		return lm_outputs
+	
+	async def async_rollout(self, dataproto: DataProto, val=False):
+		"""
+		异步多轮 rollout 的实现。
+		每个环境的 rollout 独立进行，并行进行。不在通过 config.agent_proxy.max_turn 环境交互的步频。
+		外层直接循环 env_outputs, 提交 interact loop 任务逻辑。
+		interact loop 中包含完整的 rollout 步骤，包括：
+		1. 获取当前轮次的 ctx_manager.get_lm_inputs
+		2. 生成响应 generate_sequences
+		3. 生成环境输入 ctx_manager.get_env_inputs
+		4. 环境交互 es_manager.step
+		以上循环直到满足环境退出条件
+		最后合并跟新完整的 rollout 状态。
+		"""
+
+		async def callback(completions: ChatCompletion, info: Dict[str, Any], exception: Exception):
+			assert exception is None, f"exception: {exception}"
+			env_id = info["env_id"]
+			messages = info["messages"]
+			message = completions.choices[0].message
+			messages.append({"role": message.role, "content": message.content})
+			if env_id == 0:
+				print(f'[DEBUG] callback for env_id: {env_id} add new response: {message.content}')
+		
+		async def interact_loop_callback(env_id, env_output, es_manager, ctx_manager, max_turn):
+			if env_id == 0:
+				print(f'[DEBUG] Start Async Rollout for env_id: {env_id}')
+			for i in range(max_turn): # 外部限制一下交互环境的最大轮次
+				if env_id == 0:
+					print(f'[DEBUG] Async Rollout for env_id: {env_id} turn {i}')
+				lm_inputs: DataProto = ctx_manager.get_lm_inputs([env_output], prepare_for_update=False)
+				lm_inputs.meta_info = dataproto.meta_info
+				
+				messages = lm_inputs.non_tensor_batch["messages_list"].tolist()[0]
+				pre_len = len(messages)
+				model_name = "/".join(self.config.actor_rollout_ref.model.path.split("/")[-2:])
+				if env_id == 0:
+					print(f'[DEBUG] callback for env_id: {env_id} messages: {messages}')
+					print(f'[DEBUG] callback for env_id: {env_id} model_name: {model_name}')
+				await self.async_rollout_manager.chat_scheduler.submit_chat_completions(
+					callback=callback,
+					callback_additional_info={"env_id": env_id, "messages": messages},
+					model=model_name, # https://platform.openai.com/docs/api-reference/chat/create 这里往下都是 chat_complete_request 的参数
+					messages=messages,
+					max_completion_tokens=self.config.actor_rollout_ref.rollout.response_length,
+					temperature=self.config.actor_rollout_ref.rollout.temperature,
+				)
+				assert len(messages) == pre_len + 1, f"messages length: {len(messages)} != pre_len: {pre_len} + 1"
+				lm_outputs = DataProto()
+				lm_outputs.meta_info = lm_inputs.meta_info
+				lm_outputs.non_tensor_batch = lm_inputs.non_tensor_batch.copy()
+				lm_outputs.non_tensor_batch['response_texts'] = np.array([messages[-1]["content"]], dtype=object)
+				
+				env_inputs: List[Dict] = ctx_manager.get_env_inputs(lm_outputs)
+				env_id_result, history, penalty, turn_done = await es_manager.async_step_by_env_id(env_inputs[0]['env_id'], env_inputs[0], timeout=60.0)
+				assert env_id_result == env_id, f"env_id_result: {env_id_result} != env_id: {env_id}"
+
+				es_manager.rollout_cache[env_id_result]['history'] = history
+				es_manager.rollout_cache[env_id_result]["penalty"] += penalty
+
+				if turn_done:
+					print(f'[DEBUG] env_id: {env_id} finished at turn: {i+1}')
+					break
+
+				env_output = es_manager.rollout_cache[env_id]
+	
+		s_time = time.time()
+		print(f"[DEBUG] Start Async Rollout.")
+		max_turn = self.config.agent_proxy.max_turn
+		es_manager = self.val_es_manager if val else self.train_es_manager
+		ctx_manager = self.val_ctx_manager if val else self.train_ctx_manager
+		env_outputs = es_manager.reset()
+		rollout_tasks = []
+		for env_output in env_outputs:
+			rollout_tasks.append(asyncio.create_task(interact_loop_callback(env_output['env_id'], env_output, es_manager, ctx_manager, max_turn)))
+		await asyncio.gather(*rollout_tasks)
+		print(f'[DEBUG] Async Rollout tasks finished.')
+		e_time = time.time()
+		print(f'[DEBUG] Async Rollout tasks finished in {e_time - s_time} seconds.')
+		
+		rollout_states = es_manager.get_rollout_states() 
+		rollouts = ctx_manager.formulate_rollouts(rollout_states)
+		# self.tokenizer.batch_decode(rollouts.batch['input_ids'], skip_special_tokens=False) # see all the trajectories
+		if self.llm_reward_model_wg:
+			# 对结果做奖励打分，score 作为 sequence level 的 score 放到最后
+			eval_lm_inputs: DataProto = ctx_manager.get_eval_lm_inputs(rollout_states)
+			eval_lm_outputs: DataProto = await self.async_eval_generate_sequences(eval_lm_inputs)
+			rollouts = ctx_manager.update_eval_score(rollouts, eval_lm_outputs, rollout_states)
+
+		metrics, valid_action_count, invalid_action_count = self.get_stats_from_rollout_states(rollout_states)
+		print(f'[DEBUG] rollout_states metrics: {metrics}')
+		print(f'[DEBUG] valid_action_count: {valid_action_count}')
+		print(f'[DEBUG] invalid_action_count: {invalid_action_count}')
+		rollouts.meta_info["metrics"].update(metrics)
+		return rollouts
+
 
 	def rollout(self, dataproto: DataProto, val=False):
-		print(f'[DEBUG] Start Rollout.')
+		s_time = time.time()
+		print(f"[DEBUG] Start Sync Rollout.")
 		es_manager = self.val_es_manager if val else self.train_es_manager
 		ctx_manager = self.val_ctx_manager if val else self.train_ctx_manager
 		env_outputs = es_manager.reset()
 
-		"""
-		# TODO 这里也是同步锁定了，考虑用异步流水线提升效率吧。
-		虽然verl 实现了 rollout 阶段的异步流水线，但是agent 这里需要多步交互，rollout 阶段存在切换，所以需要实现两层意义上的异步流水线：1. Env.step 异步并发，2. 上面generate_sequences 中 padded_lm_outputs = self.actor_wg.generate_sequences(padded_lm_inputs) 也要换成 self.async_rollout_manager.generate_sequences(gen_batch) 提升推理截断的异步流水线。
-		if not self.async_rollout_mode:
-			gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-		else:
-			self.async_rollout_manager.wake_up()
-			gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-			self.async_rollout_manager.sleep()
-		"""
 		for i in range(self.config.agent_proxy.max_turn):
 			print(f'[DEBUG] rollout turn {i}')
 			lm_inputs: DataProto = ctx_manager.get_lm_inputs(env_outputs, prepare_for_update=False) # 获取当前轮次的 prefill prompts
@@ -229,6 +377,10 @@ class LLMAgentProxy:
 			env_outputs: List[Dict] = es_manager.step(env_inputs)
 			if len(env_outputs) == 0: # all finished
 				break
+		print(f'[DEBUG] Sync Rollout tasks finished.')
+		e_time = time.time()
+		print(f'[DEBUG] Sync Rollout tasks finished in {e_time - s_time} seconds.')
+		
 		rollout_states = es_manager.get_rollout_states() 
 		rollouts = ctx_manager.formulate_rollouts(rollout_states)
 		# self.tokenizer.batch_decode(rollouts.batch['input_ids'], skip_special_tokens=False) # see all the trajectories

@@ -350,6 +350,30 @@ class EnvStateManager:
                 env_outputs.append(self.rollout_cache[env_id])
 
         return env_outputs
+    
+    async def async_step_by_env_id(self, env_id: int, env_input: Dict, timeout: float = 30.0):
+        import asyncio
+        import ray
+        
+        # 提交任务
+        step_future = self.env_actors[env_id].step.remote(env_input)
+        
+        # 异步等待结果
+        loop = asyncio.get_event_loop()
+        
+        def _wait_for_result():
+            ready_refs, _ = ray.wait([step_future], timeout=timeout)
+            if ready_refs:
+                return ray.get(ready_refs[0])
+            else:
+                raise TimeoutError(f"Environment {env_id} step timeout after {timeout}s")
+        
+        try:
+            result = await loop.run_in_executor(None, _wait_for_result)
+            return result
+        except Exception as e:
+            print(f"Error in async_step_by_env_id for env {env_id}: {e}")
+            raise # TODO 这里异常需要想想看怎么处理。重建 env 吗？重新开始吗？
 
     def get_rollout_states(self):
         """Get the final output for all environment actors by calling them in parallel."""

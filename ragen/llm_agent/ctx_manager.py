@@ -91,7 +91,7 @@ class ContextManager:
         self.tokenizer = tokenizer
         self.processor = processor
         self.action_sep = self.config.agent_proxy.action_sep
-        self.special_token_list = ["<think>", "</think>", "<answer>", "</answer>", "<|im_start|>", "<|im_end|>"]
+        self.special_token_list = ["<think>", "</think>", "<action>", "</action>", "<answer>", "</answer>", "<|im_start|>", "<|im_end|>"]
 
         self.es_cfg = self.config.es_manager[mode]
         self.env_nums = {
@@ -395,6 +395,7 @@ class ContextManager:
         llm_input_texts = []
         messages_list = [] # for api calling
         for env_output in env_outputs:
+            env_id = env_output["env_id"]
             if 'state' in env_output['history'][-1] and prepare_for_update:
                 env_output['history'] = env_output['history'][:-1] # when prepare for update, we do not add the state from the n+1 turn to the trajectory
             messages = [
@@ -473,14 +474,14 @@ class ContextManager:
                         # Calculate the length of the prompt without the state to determine remaining space
                         base_prompt_ids = self.tokenizer.apply_chat_template(temp_messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
                         remaining_len = max_prompt_len - len(base_prompt_ids)
-                        print(f'[DEBUG] remaining_len: {remaining_len}, base_prompt_ids length: {len(base_prompt_ids)}')
+                        print(f'[DEBUG] env_id: {env_id} remaining_len: {remaining_len}, base_prompt_ids length: {len(base_prompt_ids)}')
                         if remaining_len > 0:
                             # Tokenize the state and truncate it from the beginning to keep the most recent info
                             cnt = 5
                             while cnt > 0:
                                 state_ids = self.tokenizer.encode(state_content)
                                 truncated_state_ids = state_ids[-remaining_len:]
-                                print(f'[DEBUG] truncated_state_ids length: {len(truncated_state_ids)} in cnt: {cnt}')
+                                print(f'[DEBUG] env_id: {env_id} truncated_state_ids length: {len(truncated_state_ids)} in cnt: {cnt}')
                                 truncated_state_content = self.tokenizer.decode(truncated_state_ids, skip_special_tokens=True)
                                 truncated_state_content_ids = self.tokenizer.encode(truncated_state_content)
                                 if len(truncated_state_content_ids) <= remaining_len:
@@ -494,21 +495,21 @@ class ContextManager:
                             # TODO 这里也很有问题啊，如果前面内容太长，这里也很容易超长。 64K 训练很必要，或者截断前面的历史
                             messages[last_user_idx]['content'] = base_content
                         tmp_input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
-                        print(f'[DEBUG] before truncate length: {len(temp_input_ids)} after truncate length: {len(tmp_input_ids)}')
+                        print(f'[DEBUG] env_id: {env_id} before truncate length: {len(temp_input_ids)} after truncate length: {len(tmp_input_ids)}')
                 else:
                     print(f'[DEBUG] last_user_idx: {last_user_idx}, last turn in messages is not user turn')
 
             text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=False)
-            print(f'[DEBUG] tokenized temp_input_ids length : {len(temp_input_ids)} text length after: {len(text)}')
+            print(f'[DEBUG] env_id: {env_id} tokenized temp_input_ids length : {len(temp_input_ids)} text length after: {len(text)}')
             # print(f'[DEBUG] messages: {messages}')
             # print(f'[DEBUG] text: {text}')
-            if not prepare_for_update:
+            if not prepare_for_update: # 这里的逻辑不影响 async rollout
                 if self.config.agent_proxy.enable_think: # TODO 这里代码和配置文件耦合了，envs.yaml 配置文件中，对于输出的限定可能花样更多。 处理不好就有可能出错。
                     text += "<think>" # force the LLM to think before answering
                 else:
                     text += "<answer>" # force the LLM to answer
             llm_input_texts.append(text)
-            messages_list.append(messages)
+            messages_list.append(messages) # NOTE: messages_list 这里如何实现类似在生成时 add_generation_prompt 的约束。
 
         inputs = self.tokenizer(llm_input_texts, return_tensors="pt", padding=True, padding_side="left", truncation=False) # do not truncate here. Process later at TODO
         input_ids, attention_mask = inputs.input_ids, inputs.attention_mask
@@ -574,7 +575,14 @@ class ContextManager:
             )
         else: # dataproto has textual responses
             responses = lm_outputs.non_tensor_batch['response_texts']
-        responses = ["<think>" + response if self.config.agent_proxy.enable_think else "<answer>" + response for response in responses] # The LLM generation does not include <think> tags. Add them back here.
+
+        _responses = []
+        for response in responses:
+            if response.startswith("<think>") or response.startswith("<answer>"):
+                _responses.append(response)
+            else:
+                _responses.append("<think>" + response if self.config.agent_proxy.enable_think else "<answer>" + response) # The LLM generation does not include <think> tags. Add them back here.
+        responses = _responses
             
         env_ids = lm_outputs.non_tensor_batch['env_ids']
         env_tags = lm_outputs.non_tensor_batch['env_tags']
