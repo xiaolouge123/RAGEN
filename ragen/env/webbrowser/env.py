@@ -12,9 +12,6 @@ import numpy as np
 from PIL import Image
 from typing import Optional, Any, Dict
 from dataclasses import dataclass, field
-# import re
-# import redis
-# import pickle
 
 # register openended gym environments
 import browsergym.core
@@ -265,7 +262,8 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
             )
             self.render_cache = observation
             return observation, 0, True, {"meta_info": {"status": "answer_output", "msg": "answer turn."}} # 宣告任务结束
-
+        
+        time.sleep(random.randint(1, 3)) # 随机 sleep 1-3 秒，避免连续 action 导致环境崩溃
         unique_request_id = str(uuid.uuid4())
         valid_action, invalid_action = grep_action_items(action_str)
         self.agent_side.send((unique_request_id, {'action': action_str}))
