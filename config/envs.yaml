@@ -94,7 +94,7 @@ custom_envs:
 
   WebBrowser:
     env_type: webbrowser
-    max_actions_per_traj: 5
+    max_actions_per_traj: 20
     max_tokens: 1024
     env_config: null
     enable_world_info: True

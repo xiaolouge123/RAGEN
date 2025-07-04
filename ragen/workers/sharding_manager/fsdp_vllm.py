@@ -129,7 +129,7 @@ class FSDPVLLMShardingManager(VerlFSDPVLLMShardingManager):
 
 
     def update_params(self, updated_params):
-        model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        model = self.model_runner.model
         if model.config.architectures[0] in ['DeepseekV2ForCausalLM', 'DeepseekV3ForCausalLM']:
             loaded_params = patched_ds_v3_load_weights(
                 model, ((name, param.full_tensor() if hasattr(param, 'full_tensor') else param)

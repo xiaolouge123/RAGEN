@@ -75,6 +75,7 @@ class Task:
     instruction: str
     action_tip: str
     ground_truth: str
+    target_url: str
             
     def get_task_goal(self):
         if self.action_tip:
@@ -377,7 +378,8 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
             data_url=task["data_url"], 
             instruction=task["instruction"], 
             action_tip=task["action_tip"], 
-            ground_truth=task["ground_truth"]
+            ground_truth=task["ground_truth"],
+            target_url=task["target_url"],
             )
         self.agent_side.send(('RESET', None)) # reset the browser to blank page
         start_time = time.time()

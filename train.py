@@ -13,8 +13,6 @@ import torch
 import numpy as np
 from ragen.utils import register_resolvers
 register_resolvers()
-import sys
-import asyncio
 
 ray.init(
     runtime_env={
@@ -193,6 +191,7 @@ def run_ppo(config) -> None:
                 'TOKENIZERS_PARALLELISM': 'true',
                 'NCCL_DEBUG': 'WARN',
                 'VLLM_LOGGING_LEVEL': 'WARN',
+                "VLLM_USE_V1": "1",
                 "RAY_DEBUG": "legacy" # used here for simpler breakpoint()
             }
         })
@@ -320,11 +319,7 @@ class TaskRunner:
         )
         trainer.init_workers()
         trainer.init_agent_proxy()
-        if config.actor_rollout_ref.rollout.mode == "async":
-            print("[DEBUG] using async rollout for training")
-            asyncio.run(trainer.fit())
-        else:
-            trainer.fit()
+        trainer.fit()
 
 
 if __name__ == '__main__':

@@ -127,7 +127,7 @@ class ContextManager:
                 action_lookup_str += f"\nYou can make up to {env_config_new['max_actions_per_traj']} actions, separated by the action separator \" " + self.action_sep + " \"\n"
                 env_instruction += action_lookup_str
             if env_config_new.get("enable_world_info", False):
-                env_instruction += f"\n<CURRENT_WORLD_INFO>\nCurrent date: {datetime.now().strftime('%Y-%m-%d')}\nCurrent time: {datetime.now().strftime('%H:%M:%S')}\n</CURRENT_WORLD_INFO>"
+                env_instruction += f"\n<CURRENT_WORLD_INFO>\nCurrent date: {datetime.now().strftime('%Y-%m-%d')}\nCurrent time: {datetime.now().strftime('%H:%M:%S')}\n</CURRENT_WORLD_INFO>" # TODO 这里添加世界线信息还是有点问题，应该在每次模拟时添加相关信息。
             prefixes[env_tag] = env_instruction
             env_config_lookup[env_tag] = {'max_tokens': env_config.get("max_tokens", self.config.actor_rollout_ref.rollout.response_length)}
 
@@ -423,7 +423,7 @@ class ContextManager:
                     if "llm_response" in content:
                         messages.append({"role": "assistant", "content": content["llm_response"]})
                     
-                    if "reward" in content and not (prepare_for_update and idx == len(env_output["history"]) - 1):
+                    if "reward" in content and not (prepare_for_update and idx == len(env_output["history"]) - 1): # NOTE 在 context 显示的添加 reward 应该也不是必须的吧
                         # when prepare for update, we do not add the reward from the n+1 turn to the trajectory
                         messages.append({"role": "user", "content": f"Reward:\n{content['reward']}\n"})
                 

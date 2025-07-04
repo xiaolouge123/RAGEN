@@ -3,6 +3,7 @@ FSDP PPO Trainer with Ray-based single controller.
 Adapted from the excellently written verl implementation.
 """
 
+import asyncio
 import json
 import os
 import uuid
@@ -55,6 +56,8 @@ from verl.utils.torch_functional import masked_mean
 
 from ragen.llm_agent.agent_proxy import LLMAgentProxy
 from ragen.utils import GenerationsLogger
+
+import threading
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, bi_level_gae=False, high_level_gamma=1.0):
@@ -239,7 +242,13 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             # pad to be divisible by dp_size
             import time
             start_time = time.time()
-            test_batch = self.agent_proxy.rollout(test_gen_batch, val=True)
+            if not self.async_rollout_mode:
+                test_batch = self.agent_proxy.rollout(test_gen_batch, val=True)
+            else:
+                self.async_rollout_manager.wake_up()
+                test_batch = asyncio.run_coroutine_threadsafe(self.agent_proxy.async_rollout(test_gen_batch, val=True), self.async_rollout_loop)
+                test_batch = test_batch.result()
+                self.async_rollout_manager.sleep()
             end_time = time.time()
             print(f"validation generation time: {end_time - start_time} seconds")
             for key, value in test_batch.meta_info["metrics"].items():
@@ -380,7 +389,14 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 config=self.config.actor_rollout_ref,
                 worker_group=self.actor_rollout_wg,
             )
+            self.async_rollout_loop = asyncio.new_event_loop()
 
+            def run_loop(loop):
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            self.async_thread = threading.Thread(target=run_loop, args=(self.async_rollout_loop,), daemon=True)
+            self.async_thread.start()
 
     def _save_checkpoint(self):
         """ 
@@ -412,7 +428,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
-    async def fit(self):
+    def fit(self):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC
@@ -512,10 +528,15 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             with _timer("step", timing_raw):
                 # generate a batch
                 with _timer("gen", timing_raw):
-                    if self.config.actor_rollout_ref.rollout.mode == "async":
-                        batch = await self.agent_proxy.async_rollout(batch, val=False)
-                    else:
+                    if not self.async_rollout_mode:
                         batch = self.agent_proxy.rollout(batch, val=False)
+                    else:
+                        print(f"[DEBUG] enter async rollout")
+                        self.async_rollout_manager.wake_up()
+                        batch = asyncio.run_coroutine_threadsafe(self.agent_proxy.async_rollout(batch, val=False), self.async_rollout_loop)
+                        batch = batch.result()
+                        self.async_rollout_manager.sleep()
+
                     batch, metrics = _filter_rollout(batch)
                     metrics.update({"train/" + key: value for key, value in batch.meta_info["metrics"].items()})
 
@@ -687,6 +708,10 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                     with _timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
+                # # DEBUG only 
+                # with _timer("save_checkpoint", timing_raw):
+                #     self._save_checkpoint()
+
 
             # collect metrics
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
