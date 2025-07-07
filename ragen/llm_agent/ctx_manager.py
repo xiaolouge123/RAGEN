@@ -5,6 +5,7 @@ date: 2025-03-30
 """
 from itertools import zip_longest
 from datetime import datetime
+import copy
 import torch
 import numpy as np
 from typing import List, Dict, Any, Optional, Union
@@ -280,6 +281,7 @@ class ContextManager:
         acc_scores = score_tensor[:, -1]
         normalized_acc_scores = acc_scores.clone()
         penalty = torch.tensor([env_output.get("penalty", 0) for env_output in env_outputs], dtype=torch.float32)
+        print(f'[DEBUG] penalty: {penalty}')
         normalized_acc_scores = normalized_acc_scores + penalty
 
         if len(group2index) < acc_scores.shape[0]: # the group size > 1
@@ -299,7 +301,7 @@ class ContextManager:
             {"env_id": 2, "history": [{"state": "###\n#x_#"}]},
             ...
         ]
-        # 在 history 的第一个轮次还添加了 goal 和 gt 信息。在最后一轮还会有 final_answer (非空) 用于进行打分。 这里主要结果进行评价打分，会比下面的简单些。
+        # 在 history 的第一个轮次还添加了 goal 和 gt 信息。在最后一轮还会有 final_answer (非空) 用于进行打分。 这里主要结果进行评价打分。
         """
         # TODO 这个也可以塞到 env output 里面获取
         eval_prompt = """请根据如下问题，标准答案，测试答案，评估测试答案的正确程度。
@@ -335,7 +337,9 @@ class ContextManager:
             gt = env_output['history'][0]['gt']
             
 
-            final_answer = env_output['history'][-1]['final_answer'] if "final_answer" in env_output['history'][-1]  and env_output['history'][-1]['final_answer'] != "" else "没有找到问题答案。"
+            final_answer = env_output['history'][-1].get('final_answer') if env_output['history'][-1].get("final_answer", "") else "没有找到问题答案。"
+            if final_answer != "没有找到问题答案。":
+                print(f"[DEBUG] final_answer in get_eval_lm_inputs: {final_answer}")
 
             if gt == "" or goal == "":
                 print(f"首轮env output 没找到 goal 和 gt, 请检查 {env_output['history'][0]}")
@@ -375,7 +379,7 @@ class ContextManager:
         return llm_inputs
 
     
-    def get_lm_inputs(self, env_outputs: List[Dict], prepare_for_update: bool) -> DataProto:
+    def get_lm_inputs(self, raw_env_outputs: List[Dict], prepare_for_update: bool) -> DataProto:
         """
         env_outputs - please see below example
         [
@@ -385,6 +389,7 @@ class ContextManager:
         ]
         prefix_lookup - from env_id to initial prompt
         """
+        env_outputs = copy.deepcopy(raw_env_outputs)
         max_response_length = self.config.actor_rollout_ref.rollout.response_length
         max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
         # a safe guard for max_model_len
@@ -627,12 +632,14 @@ class ContextManager:
         Update the reward tensor with the LLM reward scores.
         """
         scores = self.get_eval_score(eval_lm_outputs) # 对于每个轨迹最终输出得分
+        print(f'[DEBUG] scores in update_eval_score: {scores}')
         input_ids = rollouts.batch['input_ids']
         score_tensor = torch.zeros_like(input_ids, dtype=torch.float32)
         score_tensor[:, -1] = torch.tensor(scores, dtype=torch.float32)
         score_tensor = score_tensor[:, 1:] # remove the first token
         normalized_score_tensor = self._normalize_score_tensor(score_tensor, env_outputs)
         rollouts.batch['llm_reward_scores'] = normalized_score_tensor
+        print(f'[DEBUG] rollouts.batch["llm_reward_scores"][:, -1]: {rollouts.batch["llm_reward_scores"][:, -1]}')
         return rollouts
 
     
