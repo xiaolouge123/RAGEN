@@ -365,15 +365,23 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
         return self.render_cache
 
     def reset(self, seed: Optional[int] = None, **kwargs: any) -> Any:
+        global_step = kwargs.get("global_step", 0)
+        total_steps = kwargs.get("total_steps", 0)
+        progress = global_step / total_steps if total_steps > 0 else 0
+        inv_progress = min(1 - progress, 0.5)
+        dummy_task = random.random() < inv_progress
+        
         with all_seed(seed):
             self.current_task_idx = random.randint(0, len(self.data['train']) - 1)
         task = self.data['train'][self.current_task_idx]
+        if dummy_task:
+            logger.info(f"Easy mode, task start at target url: {task['target_url']}")
         logger.info(f"Resetting browser env with seed: {seed}, task_id: {self.current_task_idx}")
         # print(f"current_task_idx: {self.current_task_idx} task: {task}")
         self.current_task = Task(
             task_idx=self.current_task_idx, 
             data_source=task["data_source"], 
-            data_url=task["data_url"], 
+            data_url=task["data_url"] if not dummy_task else task["target_url"], 
             instruction=task["instruction"], 
             action_tip=task["action_tip"], 
             ground_truth=task["ground_truth"],

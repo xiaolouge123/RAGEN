@@ -170,7 +170,7 @@ class EvalApiCallingWrapperWg:
         ), f"Failed to generate responses for the following messages: {failed_messages}"
 
         texts = [result["response"] for result in results]
-        print(f"[DEBUG] texts[0]: {texts[0]}")
+        # print(f"[DEBUG] texts[0]: {texts[0]}")
         lm_outputs = DataProto()
         lm_outputs.non_tensor_batch = {
             "response_texts": texts,
@@ -222,7 +222,7 @@ class EvalApiCallingWrapperWg:
         ), f"Failed to generate responses for the following messages: {failed_messages}"
 
         texts = [result["response"] for result in results]
-        print(f"[DEBUG] texts[0]: {texts[0]}")
+        # print(f"[DEBUG] texts[0]: {texts[0]}")
         lm_outputs = DataProto()
         lm_outputs.non_tensor_batch = {
             "response_texts": texts,
@@ -285,7 +285,7 @@ class LLMAgentProxy:
             raise ValueError(f"Unsupported llm reward model worker type: {type(self.llm_reward_model_wg)}")
         return lm_outputs
 
-    async def async_rollout(self, dataproto: DataProto, val=False):
+    async def async_rollout(self, dataproto: DataProto, val=False, global_step=0, total_steps=0):
         """
         异步多轮 rollout 的实现。
         每个环境的 rollout 独立进行，并行进行。不在通过 config.agent_proxy.max_turn 环境交互的步频。
@@ -354,14 +354,11 @@ class LLMAgentProxy:
                 )
 
                 env_inputs: List[Dict] = ctx_manager.get_env_inputs(lm_outputs)
-                env_id_result, history, penalty, turn_done = (
-                    await es_manager.async_step_by_env_id(
-                        env_inputs[0]["env_id"], env_inputs[0], timeout=120.0
-                    )
-                )
-                assert (
-                    env_id_result == env_id
-                ), f"env_id_result: {env_id_result} != env_id: {env_id}"
+                # for env_input in env_inputs:
+                #     if env_input.get("final_answer", ''):
+                #         print(f"[DEBUG] Aha, env_id {env_id} has final answer: {env_input['final_answer']}")
+                env_id_result, history, penalty, turn_done = await es_manager.async_step_by_env_id(env_inputs[0]["env_id"], env_inputs[0], timeout=120.0)
+                assert (env_id_result == env_id), f"env_id_result: {env_id_result} != env_id: {env_id}"
 
                 es_manager.rollout_cache[env_id_result]["history"] = history
                 es_manager.rollout_cache[env_id_result]["penalty"] += penalty
@@ -377,7 +374,7 @@ class LLMAgentProxy:
         max_turn = self.config.agent_proxy.max_turn
         es_manager = self.val_es_manager if val else self.train_es_manager
         ctx_manager = self.val_ctx_manager if val else self.train_ctx_manager
-        env_outputs = es_manager.reset()
+        env_outputs = es_manager.reset(global_step=global_step, total_steps=total_steps)
         rollout_tasks = []
         for env_output in env_outputs:
             rollout_tasks.append(
@@ -398,27 +395,28 @@ class LLMAgentProxy:
 
         rollout_states = es_manager.get_rollout_states()
         print(f"[DEBUG] async rollout_states[0]: {rollout_states[0]}")
-        rollouts = ctx_manager.formulate_rollouts(rollout_states)
-        # trajectories = self.tokenizer.batch_decode(
-        #     rollouts.batch["input_ids"], skip_special_tokens=False
-        # )  # see all the trajectories
-        # with open("./async_rollout_trajectories.txt", "w") as f:
-        #     f.write(f"async rollout trajectories\n")
-        #     f.write(f"{trajectories}\n")
-
+        rollouts = ctx_manager.formulate_rollouts(rollout_states) 
         if self.llm_reward_model_wg:
             # 对结果做奖励打分，score 作为 sequence level 的 score 放到最后
             eval_lm_inputs: DataProto = ctx_manager.get_eval_lm_inputs(rollout_states)
-            eval_lm_outputs: DataProto = await self.async_eval_generate_sequences(
-                eval_lm_inputs
-            )
-            print(
-                f'[DEBUG] eval_lm_outputs socre repsponse: {eval_lm_outputs.non_tensor_batch["response_texts"]}'
-            )
+            eval_lm_outputs: DataProto = await self.async_eval_generate_sequences(eval_lm_inputs)
+            print(f'[DEBUG] eval_lm_outputs socre repsponse: {eval_lm_outputs.non_tensor_batch["response_texts"]}')
             rollouts = ctx_manager.update_eval_score(
                 rollouts, eval_lm_outputs, rollout_states
             )
+            print(f'[DEBUG] rollouts loss_mask: {rollouts.batch["loss_mask"]}')
+            print(f'[DEBUG] rollouts rm_scores: {rollouts.batch["rm_scores"]}')
+            print(f'[DEBUG] rollouts original_rm_scores: {rollouts.batch["original_rm_scores"]}')
+            print(f'[DEBUG] rollouts llm_reward_scores: {rollouts.batch["llm_reward_scores"]}')
 
+        trajectories = self.tokenizer.batch_decode(
+            rollouts.batch["input_ids"], skip_special_tokens=False
+        )  # see all the trajectories
+        with open(f"./output_trajectories/async_rollout_trajectories_{global_step}.txt", "w") as f:
+            for trajectory in trajectories:
+                f.write(f"{trajectory}\n")
+
+        
         metrics, valid_action_count, invalid_action_count = (
             self.get_stats_from_rollout_states(rollout_states)
         )
@@ -429,7 +427,7 @@ class LLMAgentProxy:
 
         return rollouts
 
-    def rollout(self, dataproto: DataProto, val=False):
+    def rollout(self, dataproto: DataProto, val=False, global_step=0):
         s_time = time.time()
         print(f"[DEBUG] Start Sync Rollout.")
         es_manager = self.val_es_manager if val else self.train_es_manager
@@ -438,22 +436,14 @@ class LLMAgentProxy:
 
         for i in range(self.config.agent_proxy.max_turn):
             print(f"[DEBUG] rollout turn {i}")
-            lm_inputs: DataProto = ctx_manager.get_lm_inputs(
-                env_outputs, prepare_for_update=False
-            )  # 获取当前轮次的 prefill prompts
-            lm_inputs.meta_info = (
-                dataproto.meta_info
-            )  # TODO: setup vllm early stop when max length is reached. make sure this can be done
+            lm_inputs: DataProto = ctx_manager.get_lm_inputs(env_outputs, prepare_for_update=False)  # 获取当前轮次的 prefill prompts
+            lm_inputs.meta_info = (dataproto.meta_info)  # TODO: setup vllm early stop when max length is reached. make sure this can be done
             # print(f'[DEBUG] rollout turn {i} longest lm_inputs: {sorted(lm_inputs.non_tensor_batch["lm_input_texts"], key=len)[-1]}')
-            print(
-                f'[DEBUG] rollout turn {i} lm_inputs[0]: {lm_inputs.non_tensor_batch["lm_input_texts"][0]}'
-            )
+            print(f'[DEBUG] rollout turn {i} lm_inputs[0]: {lm_inputs.non_tensor_batch["lm_input_texts"][0]}')
             lm_outputs: DataProto = self.generate_sequences(lm_inputs)
 
             if lm_outputs.batch is not None and "responses" in lm_outputs.batch.keys():
-                responses = self.tokenizer.batch_decode(
-                    lm_outputs.batch["responses"], skip_special_tokens=True
-                )
+                responses = self.tokenizer.batch_decode(lm_outputs.batch["responses"], skip_special_tokens=True)
             else:  # dataproto has textual responses
                 responses = lm_outputs.non_tensor_batch["response_texts"]
             print(f"[DEBUG] rollout turn {i} responses[0]: {responses[0]}")
@@ -468,22 +458,24 @@ class LLMAgentProxy:
 
         rollout_states = es_manager.get_rollout_states()
         print(f"[DEBUG] sync rollout_states[0]: {rollout_states[0]}")
-        rollouts = ctx_manager.formulate_rollouts(rollout_states)
-        # trajectories = self.tokenizer.batch_decode(
-        #     rollouts.batch["input_ids"], skip_special_tokens=False
-        # )  # see all the trajectories
-        # with open("./sync_rollout_trajectories.txt", "w") as f:
-        #     f.write(f"sync rollout trajectories\n")
-        #     f.write(f"{trajectories}\n")
-
+        rollouts = ctx_manager.formulate_rollouts(rollout_states) 
         if self.llm_reward_model_wg:
             # 对结果做奖励打分，score 作为 sequence level 的 score 放到最后
-            # TODO: 异步提效。
             eval_lm_inputs: DataProto = ctx_manager.get_eval_lm_inputs(rollout_states)
             eval_lm_outputs: DataProto = self.eval_generate_sequences(eval_lm_inputs)
             rollouts = ctx_manager.update_eval_score(
                 rollouts, eval_lm_outputs, rollout_states
             )
+            print(f'[DEBUG] rollouts loss_mask: {rollouts.batch["loss_mask"]}')
+            print(f'[DEBUG] rollouts rm_scores: {rollouts.batch["rm_scores"]}')
+            print(f'[DEBUG] rollouts original_rm_scores: {rollouts.batch["original_rm_scores"]}')
+
+        trajectories = self.tokenizer.batch_decode(
+            rollouts.batch["input_ids"], skip_special_tokens=False
+        )  # see all the trajectories
+        with open(f"./output_trajectories/sync_rollout_trajectories_{global_step}.txt", "w") as f:
+            for trajectory in trajectories:
+                f.write(f"{trajectory}\n")
 
         metrics, valid_action_count, invalid_action_count = (
             self.get_stats_from_rollout_states(rollout_states)
@@ -524,10 +516,7 @@ class LLMAgentProxy:
         for rollout_state in rollout_states:
             trajectory_lengths.append(len(rollout_state["history"]))
 
-            if (
-                rollout_state["history"][-1].get("meta_info", {}).get("status", "")
-                == "answer_output"
-            ):
+            if rollout_state["history"][-1].get("final_answer", ""):
                 reach_answer.append(1)
             else:
                 reach_answer.append(0)

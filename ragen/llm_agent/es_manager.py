@@ -152,13 +152,13 @@ class EnvActor:
 
         return acc_reward, turn_info, turn_done, executed_actions
 
-    def reset(self, seed: Optional[int] = None):
+    def reset(self, seed: Optional[int] = None, **kwargs: any):
         # TODO 这里的重启和重试机制也不是很稳，需要能够确保有明确结果，成功/失败，上游决策是否废弃整个 ground，重新开一组环境
         """Resets the environment and returns the initial state."""
         retries = 3
         for attempt in range(retries):
             try:
-                self.env.reset(seed=seed, mode=self.mode)
+                self.env.reset(seed=seed, mode=self.mode, **kwargs)
                 self.status = EnvStatus(seed=seed)
                 self.history = []
                 next_state = self._handle_mm_state(self.env.render())
@@ -197,7 +197,7 @@ class EnvActor:
             )
 
         penalty = 0
-        if len(valid_actions) != len(actions) or not valid_actions:
+        if len(valid_actions) != len(actions) or not valid_actions: # actions/valid_actions 为[] 会减分
             penalty = self.sys_config.es_manager.format_penalty
 
         # Log state
@@ -348,7 +348,7 @@ class EnvStateManager:
         # This function is now replaced by _init_envs.
         pass
 
-    def reset(self, seed: Optional[int] = None):
+    def reset(self, seed: Optional[int] = None, **kwargs: any):
         """
         Reset the environments and get initial observation
         build up rollout cache like [{"env_id": int, "history": List[Dict], "group_id": int}, ...]
@@ -369,7 +369,7 @@ class EnvStateManager:
         # Reset all environment actors in parallel
         print("Resetting all environment actors...")
         reset_futures = [
-            actor.reset.remote(seed=s) for actor, s in zip(self.env_actors, seeds)
+            actor.reset.remote(seed=s, **kwargs) for actor, s in zip(self.env_actors, seeds)
         ]
         results = ray.get(reset_futures)
         print("All environment actors have been reset.")

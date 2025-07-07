@@ -529,11 +529,11 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 # generate a batch
                 with _timer("gen", timing_raw):
                     if not self.async_rollout_mode:
-                        batch = self.agent_proxy.rollout(batch, val=False)
+                        batch = self.agent_proxy.rollout(batch, val=False, global_step=self.global_steps, total_steps=self.total_training_steps)
                     else:
                         print(f"[DEBUG] enter async rollout")
                         self.async_rollout_manager.wake_up()
-                        batch = asyncio.run_coroutine_threadsafe(self.agent_proxy.async_rollout(batch, val=False), self.async_rollout_loop)
+                        batch = asyncio.run_coroutine_threadsafe(self.agent_proxy.async_rollout(batch, val=False, global_step=self.global_steps, total_steps=self.total_training_steps), self.async_rollout_loop)
                         batch = batch.result()
                         self.async_rollout_manager.sleep()
 
