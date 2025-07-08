@@ -399,24 +399,36 @@ class LLMAgentProxy:
         if self.llm_reward_model_wg:
             # 对结果做奖励打分，score 作为 sequence level 的 score 放到最后
             eval_lm_inputs: DataProto = ctx_manager.get_eval_lm_inputs(rollout_states)
-            eval_lm_outputs: DataProto = await self.async_eval_generate_sequences(eval_lm_inputs)
-            print(f'[DEBUG] eval_lm_outputs socre repsponse: {eval_lm_outputs.non_tensor_batch["response_texts"]}')
+            eval_lm_outputs: DataProto = await self.async_eval_generate_sequences(
+                eval_lm_inputs
+            )
+            print(f"🤖 [LLM评分] LLM评分结果: {eval_lm_outputs.non_tensor_batch['response_texts']}")
             rollouts = ctx_manager.update_eval_score(
                 rollouts, eval_lm_outputs, rollout_states
             )
-            print(f'[DEBUG] rollouts loss_mask: {rollouts.batch["loss_mask"]}')
-            print(f'[DEBUG] rollouts rm_scores: {rollouts.batch["rm_scores"]}')
-            print(f'[DEBUG] rollouts original_rm_scores: {rollouts.batch["original_rm_scores"]}')
-            print(f'[DEBUG] rollouts llm_reward_scores: {rollouts.batch["llm_reward_scores"]}')
-
+            
+            # 打印最终的reward融合结果
+            final_rewards = rollouts.batch['llm_reward_scores']
+            step_rewards = rollouts.batch.get('step_level_rewards', None)
+            llm_scores = rollouts.batch.get('pure_llm_scores', None)
+            
+            print(f"🎯 [最终REWARD] 融合后reward形状: {final_rewards.shape}")
+            print(f"🎯 [最终REWARD] 最终序列reward分数: {final_rewards.sum(dim=1).tolist()}")
+            
+            if step_rewards is not None:
+                print(f"📊 [对比分析] Step-level序列总分: {step_rewards.sum(dim=1).tolist()}")
+            if llm_scores is not None:
+                print(f"📊 [对比分析] LLM评分序列总分: {llm_scores.sum(dim=1).tolist()}")
+        else:
+            print("⚠️ [REWARD] 未启用LLM reward model，仅使用step-level rewards")
+        
         trajectories = self.tokenizer.batch_decode(
             rollouts.batch["input_ids"], skip_special_tokens=False
         )  # see all the trajectories
-        with open(f"./output_trajectories/async_rollout_trajectories_{global_step}.txt", "w") as f:
-            for trajectory in trajectories:
-                f.write(f"{trajectory}\n")
+        # with open(f"./output_trajectories/async_rollout_trajectories_{global_step}.txt", "w") as f:
+        #     for trajectory in trajectories:
+        #         f.write(f"{trajectory}\n")
 
-        
         metrics, valid_action_count, invalid_action_count = (
             self.get_stats_from_rollout_states(rollout_states)
         )
@@ -463,19 +475,31 @@ class LLMAgentProxy:
             # 对结果做奖励打分，score 作为 sequence level 的 score 放到最后
             eval_lm_inputs: DataProto = ctx_manager.get_eval_lm_inputs(rollout_states)
             eval_lm_outputs: DataProto = self.eval_generate_sequences(eval_lm_inputs)
+            print(f"🤖 [LLM评分] LLM评分结果: {eval_lm_outputs.non_tensor_batch['response_texts']}")
             rollouts = ctx_manager.update_eval_score(
                 rollouts, eval_lm_outputs, rollout_states
             )
-            print(f'[DEBUG] rollouts loss_mask: {rollouts.batch["loss_mask"]}')
-            print(f'[DEBUG] rollouts rm_scores: {rollouts.batch["rm_scores"]}')
-            print(f'[DEBUG] rollouts original_rm_scores: {rollouts.batch["original_rm_scores"]}')
-
+            
+            # 打印最终的reward融合结果
+            final_rewards = rollouts.batch['llm_reward_scores']
+            step_rewards = rollouts.batch.get('step_level_rewards', None)
+            llm_scores = rollouts.batch.get('pure_llm_scores', None)
+            
+            print(f"🎯 [最终REWARD] 融合后reward形状: {final_rewards.shape}")
+            print(f"🎯 [最终REWARD] 最终序列reward分数: {final_rewards.sum(dim=1).tolist()}")
+            
+            if step_rewards is not None:
+                print(f"📊 [对比分析] Step-level序列总分: {step_rewards.sum(dim=1).tolist()}")
+            if llm_scores is not None:
+                print(f"📊 [对比分析] LLM评分序列总分: {llm_scores.sum(dim=1).tolist()}")
+        else:
+            print("⚠️ [REWARD] 未启用LLM reward model，仅使用step-level rewards")
         trajectories = self.tokenizer.batch_decode(
             rollouts.batch["input_ids"], skip_special_tokens=False
         )  # see all the trajectories
-        with open(f"./output_trajectories/sync_rollout_trajectories_{global_step}.txt", "w") as f:
-            for trajectory in trajectories:
-                f.write(f"{trajectory}\n")
+        # with open(f"./output_trajectories/sync_rollout_trajectories_{global_step}.txt", "w") as f:
+        #     for trajectory in trajectories:
+        #         f.write(f"{trajectory}\n")
 
         metrics, valid_action_count, invalid_action_count = (
             self.get_stats_from_rollout_states(rollout_states)
@@ -484,6 +508,28 @@ class LLMAgentProxy:
         print(f"[DEBUG] valid_action_count: {valid_action_count}")
         print(f"[DEBUG] invalid_action_count: {invalid_action_count}")
         rollouts.meta_info["metrics"].update(metrics)
+
+        print(f"📈 本次rollout平均reward: {avg_reward:.4f}")
+        
+        # 最关键的检查：确认什么会被用于训练
+        print(f"\n🔥 [训练数据确认] - 最终用于PPO训练的数据:")
+        if llm_reward_scores is not None:
+            print(f"✅ 训练将使用: llm_reward_scores (融合后的reward)")
+            training_rewards = llm_reward_scores.sum(dim=1)
+        elif rm_scores is not None:
+            print(f"⚠️ 训练将使用: rm_scores (原始step reward)")
+            training_rewards = rm_scores.sum(dim=1)
+        else:
+            print(f"❌ 没有可用的reward tensor进行训练!")
+            training_rewards = None
+            
+        if training_rewards is not None:
+            print(f"🎯 训练序列rewards: {training_rewards.tolist()}")
+            print(f"📊 训练reward统计 - 平均: {training_rewards.mean():.4f}, 最大: {training_rewards.max():.4f}, 最小: {training_rewards.min():.4f}")
+        
+        print("="*60)
+        print("")  # 空行分隔
+
         return rollouts
 
     def get_stats_from_rollout_states(self, rollout_states: List[Dict]):
@@ -617,11 +663,65 @@ def main(config):
         end_time = time.time()
         print(f"rollout time: {end_time - start_time} seconds")
         # print rollout rewards from the rm_scores
-        rm_scores = rollouts.batch["rm_scores"]
+        print("\n" + "="*60)
+        print("🎯 [最终得分详情分析]")
+        print("="*60)
+        
+        # 检查rollouts中包含的所有reward相关字段
+        batch_keys = list(rollouts.batch.keys())
+        reward_keys = [key for key in batch_keys if 'reward' in key.lower() or 'score' in key.lower()]
+        print(f"📊 Rollouts batch中的所有reward相关字段: {reward_keys}")
+        
+        # 获取主要的reward字段
+        rm_scores = rollouts.batch.get("rm_scores", None)
+        llm_reward_scores = rollouts.batch.get("llm_reward_scores", None)
+        step_level_rewards = rollouts.batch.get("step_level_rewards", None)
+        pure_llm_scores = rollouts.batch.get("pure_llm_scores", None)
+        
+        print(f"🔍 rm_scores是否存在: {rm_scores is not None}")
+        print(f"🔍 llm_reward_scores是否存在: {llm_reward_scores is not None}")
+        print(f"🔍 step_level_rewards是否存在: {step_level_rewards is not None}")
+        print(f"🔍 pure_llm_scores是否存在: {pure_llm_scores is not None}")
+        
+        # 分析主要使用的reward tensor
+        if llm_reward_scores is not None:
+            print(f"✅ 使用的是融合后的 llm_reward_scores")
+            main_reward_tensor = llm_reward_scores
+            print(f"📐 llm_reward_scores形状: {llm_reward_scores.shape}")
+            print(f"💰 llm_reward_scores每序列总分: {llm_reward_scores.sum(dim=1).tolist()}")
+            avg_reward = llm_reward_scores.sum(-1).mean().item()
+        elif rm_scores is not None:
+            print(f"⚠️ 使用的是原始的 rm_scores (可能未融合)")
+            main_reward_tensor = rm_scores
+            print(f"📐 rm_scores形状: {rm_scores.shape}")
+            print(f"💰 rm_scores每序列总分: {rm_scores.sum(dim=1).tolist()}")
+            avg_reward = rm_scores.sum(-1).mean().item()
+        else:
+            print(f"❌ 没有找到任何reward tensor!")
+            avg_reward = 0.0
+        
+        print(f"📈 本次rollout平均reward: {avg_reward:.4f}")
+        
+        # 最关键的检查：确认什么会被用于训练
+        print(f"\n🔥 [训练数据确认] - 最终用于PPO训练的数据:")
+        if llm_reward_scores is not None:
+            print(f"✅ 训练将使用: llm_reward_scores (融合后的reward)")
+            training_rewards = llm_reward_scores.sum(dim=1)
+        elif rm_scores is not None:
+            print(f"⚠️ 训练将使用: rm_scores (原始step reward)")
+            training_rewards = rm_scores.sum(dim=1)
+        else:
+            print(f"❌ 没有可用的reward tensor进行训练!")
+            training_rewards = None
+            
+        if training_rewards is not None:
+            print(f"🎯 训练序列rewards: {training_rewards.tolist()}")
+            print(f"📊 训练reward统计 - 平均: {training_rewards.mean():.4f}, 最大: {training_rewards.max():.4f}, 最小: {training_rewards.min():.4f}")
+        
+        print("="*60)
+        print("")  # 空行分隔
+        
         metrics = rollouts.meta_info["metrics"]
-        avg_reward = rm_scores.sum(-1).mean().item()
-        print(f"rollout rewards: {avg_reward}")
-        print(f"metrics:")
         for k, v in metrics.items():
             print(f"{k}: {v}")
 

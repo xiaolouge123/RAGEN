@@ -430,7 +430,9 @@ class ContextManager:
                     
                     if "reward" in content and not (prepare_for_update and idx == len(env_output["history"]) - 1): # NOTE 在 context 显示的添加 reward 应该也不是必须的吧
                         # when prepare for update, we do not add the reward from the n+1 turn to the trajectory
-                        messages.append({"role": "user", "content": f"Reward:\n{content['reward']}\n"})
+                        reward_value = content['reward']
+                        print(f"💰 [CONTEXT REWARD] env_id: {env_output['env_id']}, turn: {idx+1}, reward: {reward_value}")
+                        messages.append({"role": "user", "content": f"Reward:\n{reward_value}\n"})
                 
                 else:
                     messages[-1]["content"] += f"\nTurn {idx + 1}:\n"
@@ -443,7 +445,9 @@ class ContextManager:
                         messages.append({"role": "assistant", "content": content["llm_response"]})
                     if "reward" in content and not (prepare_for_update and idx == len(env_output["history"]) - 1):
                         # when prepare for update, we do not add the reward from the n+1 turn to the trajectory
-                        messages.append({"role": "user", "content": f"Reward:\n{content['reward']}\n"})
+                        reward_value = content['reward']
+                        print(f"💰 [CONTEXT REWARD] env_id: {env_output['env_id']}, turn: {idx+1}, reward: {reward_value}")
+                        messages.append({"role": "user", "content": f"Reward:\n{reward_value}\n"})
                     
 
             # NOTE: this assertion is important for loss mask computation        
@@ -605,6 +609,19 @@ class ContextManager:
 
     def formulate_rollouts(self, env_outputs: List[Dict]) -> DataProto:
         llm_inputs = self.get_lm_inputs(env_outputs, prepare_for_update=True)
+        
+        # 打印step-level reward信息
+        if 'rm_scores' in llm_inputs.batch:
+            step_rewards = llm_inputs.batch['rm_scores']
+            print(f"📈 [STEP REWARDS] Formulate rollouts中的step-level rewards形状: {step_rewards.shape}")
+            print(f"📈 [STEP REWARDS] 每个轨迹的最终step reward: {step_rewards[:, -1].tolist()}")
+            
+            # 计算每个轨迹的累积reward
+            cumulative_rewards = step_rewards.sum(dim=1)
+            print(f"📈 [STEP REWARDS] 每个轨迹的累积reward: {cumulative_rewards.tolist()}")
+        else:
+            print("⚠️ [STEP REWARDS] 未找到step-level rewards!")
+            
         return llm_inputs
     
     def get_eval_score(self, lm_outputs: DataProto) -> List[float]:
@@ -630,16 +647,60 @@ class ContextManager:
     def update_eval_score(self, rollouts: DataProto, eval_lm_outputs: DataProto, env_outputs: List[Dict]):
         """
         Update the reward tensor with the LLM reward scores.
+        现在同时考虑step-level reward和LLM评分
         """
-        scores = self.get_eval_score(eval_lm_outputs) # 对于每个轨迹最终输出得分
-        print(f'[DEBUG] scores in update_eval_score: {scores}')
+        llm_scores = self.get_eval_score(eval_lm_outputs) # 对于每个轨迹最终输出得分
         input_ids = rollouts.batch['input_ids']
-        score_tensor = torch.zeros_like(input_ids, dtype=torch.float32)
-        score_tensor[:, -1] = torch.tensor(scores, dtype=torch.float32)
+        
+        # 首先获取现有的step-level rewards
+        existing_score_tensor = rollouts.batch.get('rm_scores', torch.zeros_like(input_ids, dtype=torch.float32))
+        print(f"🔄 [REWARD融合] 现有step-level reward tensor形状: {existing_score_tensor.shape}")
+        
+        # 创建新的score tensor，保留现有的step-level rewards
+        score_tensor = existing_score_tensor.clone()
+        
+        # 在最后一个token位置添加LLM评分（加权组合）
+        step_final_scores = score_tensor[:, -1].clone()  # 获取最后一步的step-level reward
+        llm_final_scores = torch.tensor(llm_scores, dtype=torch.float32)
+        
+        # 加权组合：70%step-level reward + 30%LLM评分
+        # 您可以通过配置文件调整这个权重
+        step_weight = getattr(self.config.agent_proxy, 'step_reward_weight', 0.7)
+        llm_weight = getattr(self.config.agent_proxy, 'llm_reward_weight', 0.3)
+        
+        # 确保权重和为1
+        total_weight = step_weight + llm_weight
+        if total_weight > 0:
+            step_weight = step_weight / total_weight
+            llm_weight = llm_weight / total_weight
+        else:
+            step_weight, llm_weight = 0.7, 0.3
+            
+        combined_scores = step_weight * step_final_scores + llm_weight * llm_final_scores
+        
+        print(f"📊 [REWARD融合] Step-level最终分数: {step_final_scores.tolist()}")
+        print(f"📊 [REWARD融合] LLM评分: {llm_final_scores.tolist()}")
+        print(f"📊 [REWARD融合] 组合后分数: {combined_scores.tolist()}")
+        print(f"📊 [REWARD融合] 权重配置: step={step_weight}, llm={llm_weight}")
+        
+        score_tensor[:, -1] = combined_scores
         score_tensor = score_tensor[:, 1:] # remove the first token
         normalized_score_tensor = self._normalize_score_tensor(score_tensor, env_outputs)
         rollouts.batch['llm_reward_scores'] = normalized_score_tensor
         print(f'[DEBUG] rollouts.batch["llm_reward_scores"][:, -1]: {rollouts.batch["llm_reward_scores"][:, -1]}')
+        
+        # 同时保存原始的step-level rewards以便调试
+        rollouts.batch['step_level_rewards'] = existing_score_tensor[:, 1:]
+        rollouts.batch['pure_llm_scores'] = torch.zeros_like(input_ids, dtype=torch.float32)
+        rollouts.batch['pure_llm_scores'][:, -1] = llm_final_scores
+        rollouts.batch['pure_llm_scores'] = rollouts.batch['pure_llm_scores'][:, 1:]
+        
+        # 打印最终的DataProto结构确认
+        print(f"🔍 [最终DATAPROTO] rollouts.batch的所有键: {list(rollouts.batch.keys())}")
+        print(f"🔍 [最终DATAPROTO] 是否包含rm_scores: {'rm_scores' in rollouts.batch}")
+        print(f"🔍 [最终DATAPROTO] 是否包含llm_reward_scores: {'llm_reward_scores' in rollouts.batch}")
+        print(f"🔍 [最终DATAPROTO] 最终使用的reward字段应该是: llm_reward_scores")
+        
         return rollouts
 
     

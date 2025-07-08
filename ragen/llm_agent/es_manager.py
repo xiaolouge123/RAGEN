@@ -179,6 +179,7 @@ class EnvActor:
 
     def step(self, env_input: Dict):
         """Steps the environment with the given actions."""
+        
         actions = env_input["actions"]
 
         actions_left_before = self.max_actions_per_traj - self.status.num_actions

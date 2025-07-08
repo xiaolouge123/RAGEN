@@ -39,7 +39,7 @@ actor_rollout_ref:
     optim:
       betas: [0.9, 0.999]
     fsdp_config:
-      model_dtype: float32
+      model_dtype: bfloat16
   ref:
     log_prob_micro_batch_size_per_gpu: ${micro_batch_size_per_gpu} # following micro_batch_size_per_gpu
     fsdp_config:
@@ -119,7 +119,7 @@ trainer:
     val: 20
   logger: [ 'console', "tensorboard" ]
   save_freq: 10
-  default_local_dir: /rt-vepfs/zyc/expr/checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_local_dir: /rt-vepfs/wqs/expr/checkpoints/${trainer.project_name}/${trainer.experiment_name}
   max_actor_ckpt_to_keep: 3
   max_critic_ckpt_to_keep: 3
 

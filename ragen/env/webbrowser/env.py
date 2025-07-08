@@ -240,6 +240,112 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                     pass
                 return
 
+    def calculate_reward(self, current_url: str, action_str: str, observation: BrowserOutputObservation) -> float:
+        """
+        根据当前URL与目标URL的对比计算reward分数
+        
+        Args:
+            current_url: 当前访问的URL
+            action_str: 执行的动作字符串
+            observation: 浏览器观察结果
+            
+        Returns:
+            float: reward分数
+        """
+        if not self.current_task or not self.current_task.target_url:
+            print("🔍 [REWARD] 无目标URL或任务信息，返回0分")
+            return 0.0
+            
+        target_url = self.current_task.target_url.strip()
+        current_url = current_url.strip()
+        
+        print("\n" + "="*80)
+        print("🎯 [REWARD 计算过程]")
+        print(f"📌 目标URL: {target_url}")
+        print(f"🌐 当前URL: {current_url}")
+        print(f"🎬 执行动作: {action_str}")
+        print(f"❌ 是否错误: {observation.error}")
+        
+        # 如果出现错误，给予负奖励
+        if observation.error:
+            reward = -0.5
+            print(f"💥 检测到错误，给予负奖励: {reward}")
+            print("="*80 + "\n")
+            return reward
+            
+        # 如果是无效动作，给予负奖励
+        if action_str == "<invalid_action>":
+            reward = -0.3
+            print(f"🚫 无效动作，给予负奖励: {reward}")
+            print("="*80 + "\n")
+            return reward
+            
+        # 如果是答案输出，根据URL匹配度给予奖励
+        if "<answer>" in action_str:
+            print("📝 检测到答案输出，进行最终评估...")
+            if current_url == target_url:
+                reward = 1.0  # 完全匹配，最高奖励
+                print(f"🎉 URL完全匹配！最高奖励: {reward}")
+            elif target_url in current_url or current_url in target_url:
+                reward = 0.5  # 部分匹配
+                print(f"✅ URL部分匹配，给予奖励: {reward}")
+            else:
+                reward = -0.2  # 答案输出但URL不匹配
+                print(f"⚠️  答案输出但URL不匹配，给予负奖励: {reward}")
+            print("="*80 + "\n")
+            return reward
+        
+        # 普通动作的奖励计算
+        print("🔄 普通动作，开始评估URL匹配度...")
+        
+        if not current_url or current_url in ['about:blank', '']:
+            reward = -0.1  # 在空白页，给予小负奖励
+            print(f"📄 在空白页面，给予小负奖励: {reward}")
+            print("="*80 + "\n")
+            return reward
+            
+        # URL完全匹配
+        if current_url == target_url:
+            reward = 0.8
+            print(f"🎯 URL完全匹配！给予高奖励: {reward}")
+            print("="*80 + "\n")
+            return reward
+            
+        # URL部分匹配（包含关系）
+        if target_url in current_url or current_url in target_url:
+            reward = 0.4
+            print(f"🔗 URL部分匹配，给予中等奖励: {reward}")
+            print("="*80 + "\n")
+            return reward
+            
+        # 检查域名匹配
+        try:
+            from urllib.parse import urlparse
+            current_domain = urlparse(current_url).netloc
+            target_domain = urlparse(target_url).netloc
+            
+            print(f"🏠 当前域名: {current_domain}")
+            print(f"🎯 目标域名: {target_domain}")
+            
+            if current_domain == target_domain:
+                reward = 0.2  # 同域名，给予小正奖励
+                print(f"🏡 域名完全匹配，给予小正奖励: {reward}")
+                print("="*80 + "\n")
+                return reward
+            elif target_domain in current_domain or current_domain in target_domain:
+                reward = 0.1  # 域名部分匹配
+                print(f"🏘️  域名部分匹配，给予微小正奖励: {reward}")
+                print("="*80 + "\n")
+                return reward
+        except Exception as e:
+            print(f"🔧 域名解析失败: {e}")
+            
+        # 默认情况，给予小负奖励，鼓励向目标前进
+        reward = -0.05
+        print(f"🚶 默认情况，给予小负奖励鼓励前进: {reward}")
+        print("="*80 + "\n")
+        return reward
+
     def step(self, action_str: str, timeout: float = 100) -> tuple[BrowserOutputObservation, float, bool, dict]:
         """
         Execute an action in the browser environment and return the observation.
@@ -247,7 +353,9 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
         """
         if action_str == "<invalid_action>":
             self.render_cache.update_error("Not a valid action. Stay in the same page.")
-            return self.render_cache, 0, False, {"meta_info": {"status": "action_error", "msg": "Not a valid action."}}
+            reward = self.calculate_reward(self.render_cache.url, action_str, self.render_cache)
+            print(f"🎮 [STEP结果] 无效动作处理完成，最终reward: {reward}")
+            return self.render_cache, reward, False, {"meta_info": {"status": "action_error", "msg": "Not a valid action."}}
 
         if "<answer>" in action_str:
             answer = action_str.split("<answer>")[1].split("</answer>")[0]
@@ -261,7 +369,9 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                 final_answer=answer,
             )
             self.render_cache = observation
-            return observation, 0, True, {"meta_info": {"status": "answer_output", "msg": "answer turn."}} # 宣告任务结束
+            reward = self.calculate_reward(self.render_cache.url, action_str, observation)
+            print(f"🎮 [STEP结果] 答案输出处理完成，最终reward: {reward}, 任务结束!")
+            return observation, reward, True, {"meta_info": {"status": "answer_output", "msg": "answer turn."}} # 宣告任务结束
         
         time.sleep(random.randint(1, 3)) # 随机 sleep 1-3 秒，避免连续 action 导致环境崩溃
         unique_request_id = str(uuid.uuid4())
@@ -277,8 +387,10 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                     if response_id == unique_request_id: # TODO 限制了同步串行行为
                         observation = BrowserOutputObservation(**format_browser_observation(obs))
                         self.render_cache = observation
-                        # TODO 具体每一轮次 action 的 reward 和 done 需要外部评估器评估，除了异常报错的问题
-                        return observation, 0, False, {"meta_info": {"status": "action_output", "msg": "action turn", "valid_action": valid_action, "invalid_action": invalid_action}} # TODO 还有 reward, done, info 等额外信息需要添加。
+                        # 计算基于URL对比的reward
+                        reward = self.calculate_reward(observation.url, action_str, observation)
+                        print(f"🎮 [STEP结果] 普通动作执行完成，最终reward: {reward}")
+                        return observation, reward, False, {"meta_info": {"status": "action_output", "msg": "action turn", "valid_action": valid_action, "invalid_action": invalid_action}}
         except Exception as e:
             logger.error(f'Encountered an error when executing browser action: {e}, input action: {action_str}')
             observation = BrowserOutputObservation(
@@ -290,7 +402,9 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                 trigger_by_action='browse_interactive',
             )
             self.render_cache = observation
-            return observation, 0, False, {"meta_info": {"status": "exception", "msg": "action turn", "valid_action": valid_action, "invalid_action": invalid_action}} # TODO 当出现异常报错的时候，是否可以放心评判，rewar= 0 和 done=Ture
+            reward = self.calculate_reward(observation.url, action_str, observation)
+            print(f"🎮 [STEP结果] 异常处理完成，最终reward: {reward}")
+            return observation, reward, False, {"meta_info": {"status": "exception", "msg": "action turn", "valid_action": valid_action, "invalid_action": invalid_action}}
                     
 
     def check_alive(self, timeout: float = 60):
