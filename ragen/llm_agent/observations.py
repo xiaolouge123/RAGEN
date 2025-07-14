@@ -135,5 +135,6 @@ class BrowserOutputObservation:
             with_clickable=True,
             skip_generic=False,
             filter_visible_only=filter_visible_only,
+            ignored_roles=["LineBreak", "image"], # NOTE: 这里需要处理一下，主要新增 image 类型，目前不考虑视觉输入，同时 image 标签可能会占用很大空间
         )
         return cur_axtree_txt
