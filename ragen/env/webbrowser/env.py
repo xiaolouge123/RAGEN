@@ -187,7 +187,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                         # reset 后也没必要给外面看空白页
                         obs, info = env.reset()
                         # TODO 考虑封装一下
-                        html_str = flatten_dom_to_str(obs['dom_object']) # 
+                        html_str = flatten_dom_to_str(obs['dom_object'], ignored_roles=["LineBreak", "image"]) # NOTE: 这里需要处理一下，主要新增 image 类型，目前不考虑视觉输入，同时 image 标签可能会占用很大空间
                         obs['text_content'] = self.html_text_converter.handle(html_str)
                         # make observation serializable
                         obs['set_of_marks'] = self.image_to_png_base64_url(
@@ -211,7 +211,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
 
                     # TODO 考虑封装一下
                     # add text content of the page
-                    html_str = flatten_dom_to_str(obs['dom_object']) # 
+                    html_str = flatten_dom_to_str(obs['dom_object'], ignored_roles=["LineBreak", "image"]) # NOTE: 这里需要处理一下，主要新增 image 类型，目前不考虑视觉输入，同时 image 标签可能会占用很大空间
                     obs['text_content'] = self.html_text_converter.handle(html_str)
                     # make observation serializable
                     obs['set_of_marks'] = self.image_to_png_base64_url(
@@ -368,7 +368,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
         global_step = kwargs.get("global_step", 0)
         total_steps = kwargs.get("total_steps", 0)
         progress = global_step / total_steps if total_steps > 0 else 0
-        inv_progress = min(1 - progress, 0.5)
+        inv_progress = min(1 - progress, 0.1)
         dummy_task = random.random() < inv_progress
         
         with all_seed(seed):
