@@ -10,10 +10,11 @@ import hydra
 import os
 from verl import DataProto
 import torch
+# torch.autograd.set_detect_anomaly(True)
 import numpy as np
 from ragen.utils import register_resolvers
 register_resolvers()
-
+os.environ["RAY_TMPDIR"] = "/rt-vepfs/wqs/expr/ray_tmp"
 ray.init(
     runtime_env={
         "env_vars": {

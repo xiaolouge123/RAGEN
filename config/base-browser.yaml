@@ -35,7 +35,7 @@ actor_rollout_ref:
     clip_ratio_low: 0.2
     clip_ratio_high: 0.28
     grpo_advantage_length_weight: ${grpo_advantage_length_weight}
-    ulysses_sequence_parallel_size: 4
+    ulysses_sequence_parallel_size: 1
     optim:
       betas: [0.9, 0.999]
     fsdp_config:
@@ -48,7 +48,7 @@ actor_rollout_ref:
     mode: async
     log_prob_micro_batch_size_per_gpu: ${micro_batch_size_per_gpu} # following micro_batch_size_per_gpu
     tensor_model_parallel_size: 4
-    max_model_len: 65536
+    max_model_len: 24000
     prompt_length: 1 # useless. Just put it here
     response_length: 1024 # single-turn response length
     gpu_memory_utilization: 0.5
@@ -117,7 +117,7 @@ trainer:
   generations_to_log_to_wandb: 
     train: 128 # TODO: will be implemented
     val: 20
-  logger: [ 'console', "tensorboard" ]
+  logger: [ 'console', "swanlab" ]
   save_freq: 10
   default_local_dir: /rt-vepfs/wqs/expr/checkpoints/${trainer.project_name}/${trainer.experiment_name}
   max_actor_ckpt_to_keep: 3
@@ -127,7 +127,12 @@ agent_proxy:
   max_turn: 20
   action_sep: "\n"
   max_actions_per_turn: 2 # how many actions can be output at most in a single turn
-  use_turn_scores: False # important to GAE when applying token-level rewards to token-level advantages. If False, will take the sum of scores as the reward for the last turn. 如果是基于LLM打分最终答案的策略，这里也是 False。除非后需有对轨迹信息按轮次的奖励策略。
+  use_turn_scores: True # 奖励分配策略控制：
+  # - False: 将所有轮次奖励累积后放在最后一个token（适合终局评分）
+  # - True: 将每轮奖励放在对应轮次的最后token（适合过程奖励）
+  # 重要提示：设为True时，过程reward分配到各轮次，LLM评分独立分配到最后token
+  # 两种奖励信号保持独立，不进行融合
+  
   enable_think: True # False -> no think RL
   reward_normalization:
     grouping: "state" # state / batch / inductive

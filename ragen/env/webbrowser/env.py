@@ -240,111 +240,317 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                     pass
                 return
 
-    def calculate_reward(self, current_url: str, action_str: str, observation: BrowserOutputObservation) -> float:
+    def calculate_reward(
+        self,
+        current_url: str,
+        action_str: str,
+        observation: BrowserOutputObservation
+    ) -> float:
         """
-        根据当前URL与目标URL的对比计算reward分数
+        根据当前URL与目标URL的对比计算 reward 分数（0~10）。
+        采用过程奖励机制，鼓励模型逐步接近目标网站。
         
-        Args:
-            current_url: 当前访问的URL
-            action_str: 执行的动作字符串
-            observation: 浏览器观察结果
-            
-        Returns:
-            float: reward分数
+        评分策略：
+        - 错误/无效动作: 0分
+        - 普通动作阶段: 0-8分 (基础分+进步奖励)
+        - 答案输出阶段: 2-10分 (根据最终匹配度)
         """
         if not self.current_task or not self.current_task.target_url:
-            print("🔍 [REWARD] 无目标URL或任务信息，返回0分")
             return 0.0
-            
+
         target_url = self.current_task.target_url.strip()
         current_url = current_url.strip()
-        
-        print("\n" + "="*80)
-        print("🎯 [REWARD 计算过程]")
-        print(f"📌 目标URL: {target_url}")
-        print(f"🌐 当前URL: {current_url}")
-        print(f"🎬 执行动作: {action_str}")
-        print(f"❌ 是否错误: {observation.error}")
-        
-        # 如果出现错误，给予负奖励
+
+        print(f"[REWARD] 目标URL: {target_url}")
+        print(f"[REWARD] 当前URL: {current_url}")
+        print(f"[REWARD] 动作: {action_str}")
+
+        # 1) 错误或无效动作 - 0分
         if observation.error:
-            reward = -0.5
-            print(f"💥 检测到错误，给予负奖励: {reward}")
-            print("="*80 + "\n")
-            return reward
-            
-        # 如果是无效动作，给予负奖励
+            print(f"[REWARD] 检测到错误，给予0分")
+            return 0.0
+        
         if action_str == "<invalid_action>":
-            reward = -0.3
-            print(f"🚫 无效动作，给予负奖励: {reward}")
-            print("="*80 + "\n")
-            return reward
-            
-        # 如果是答案输出，根据URL匹配度给予奖励
+            print(f"[REWARD] 无效动作，给予0分")
+            return 0.0
+
+        # 2) <answer> 阶段 - 最终评估 (2-10分)
         if "<answer>" in action_str:
-            print("📝 检测到答案输出，进行最终评估...")
+            print(f"[REWARD] 答案输出阶段，进行最终评估")
             if current_url == target_url:
-                reward = 1.0  # 完全匹配，最高奖励
-                print(f"🎉 URL完全匹配！最高奖励: {reward}")
-            elif target_url in current_url or current_url in target_url:
-                reward = 0.5  # 部分匹配
-                print(f"✅ URL部分匹配，给予奖励: {reward}")
+                print(f"[REWARD] 完美匹配！给予10分")
+                return 10.0
+            
+            similarity = self._calculate_url_similarity(current_url, target_url)
+            if similarity >= 8.0:
+                reward = 9.0
+                print(f"[REWARD] 高度匹配(相似度:{similarity:.1f})，给予{reward}分")
+            elif similarity >= 6.0:
+                reward = 7.0
+                print(f"[REWARD] 中等匹配(相似度:{similarity:.1f})，给予{reward}分")
+            elif similarity >= 3.0:
+                reward = 5.0
+                print(f"[REWARD] 低匹配(相似度:{similarity:.1f})，给予{reward}分")
             else:
-                reward = -0.2  # 答案输出但URL不匹配
-                print(f"⚠️  答案输出但URL不匹配，给予负奖励: {reward}")
-            print("="*80 + "\n")
+                reward = 2.0
+                print(f"[REWARD] 很低匹配(相似度:{similarity:.1f})，给予{reward}分")
             return reward
+
+        # 3) 普通动作阶段 - 过程奖励 (0-8分)
+        current_similarity = self._calculate_url_similarity(current_url, target_url)
+        print(f"[REWARD] 当前URL相似度: {current_similarity:.2f}")
         
-        # 普通动作的奖励计算
-        print("🔄 普通动作，开始评估URL匹配度...")
+        # 获取上一步的相似度
+        previous_similarity = getattr(self, '_previous_url_similarity', 0.0)
+        print(f"[REWARD] 上一步URL相似度: {previous_similarity:.2f}")
         
-        if not current_url or current_url in ['about:blank', '']:
-            reward = -0.1  # 在空白页，给予小负奖励
-            print(f"📄 在空白页面，给予小负奖励: {reward}")
-            print("="*80 + "\n")
-            return reward
-            
-        # URL完全匹配
+        # 基础分数：基于当前相似度 (0-5分)
+        base_score = (current_similarity / 10.0) * 5.0
+        
+        # 进步奖励：如果比上一步更接近目标 (0-3分)
+        progress = current_similarity - previous_similarity
+        if progress > 0:
+            progress_bonus = min(progress * 0.5, 3.0)  # 进步奖励最多3分
+            print(f"[REWARD] 检测到进步: +{progress:.2f}，进步奖励: {progress_bonus:.2f}")
+        else:
+            progress_bonus = 0.0
+            if progress < 0:
+                print(f"[REWARD] 相似度下降: {progress:.2f}")
+            else:
+                print(f"[REWARD] 相似度无变化")
+        
+        # 更新历史记录
+        self._previous_url_similarity = current_similarity
+        
+        # 总分计算
+        total_reward = base_score + progress_bonus
+        total_reward = min(total_reward, 8.0)  # 普通阶段最高8分，为answer阶段留出空间
+        
+        print(f"[REWARD] 基础分: {base_score:.2f}, 进步奖励: {progress_bonus:.2f}, 总分: {total_reward:.2f}")
+        return total_reward
+
+    def _calculate_url_similarity(self, current_url: str, target_url: str) -> float:
+        """
+        计算两个URL的相似度，返回0-10分
+        
+        评分维度：
+        - 域名匹配: 0-6分
+        - 路径匹配: 0-4分
+        """
+        if not current_url or current_url in ("about:blank", ""):
+            return 0.0
+        
         if current_url == target_url:
-            reward = 0.8
-            print(f"🎯 URL完全匹配！给予高奖励: {reward}")
-            print("="*80 + "\n")
-            return reward
-            
-        # URL部分匹配（包含关系）
-        if target_url in current_url or current_url in target_url:
-            reward = 0.4
-            print(f"🔗 URL部分匹配，给予中等奖励: {reward}")
-            print("="*80 + "\n")
-            return reward
-            
-        # 检查域名匹配
+            return 10.0
+        
+        from urllib.parse import urlparse
+        
         try:
-            from urllib.parse import urlparse
-            current_domain = urlparse(current_url).netloc
-            target_domain = urlparse(target_url).netloc
+            curr_parsed = urlparse(current_url)
+            target_parsed = urlparse(target_url)
             
-            print(f"🏠 当前域名: {current_domain}")
-            print(f"🎯 目标域名: {target_domain}")
+            # 域名评分 (0-6分)
+            domain_score = self._calculate_domain_similarity(curr_parsed.netloc, target_parsed.netloc)
             
-            if current_domain == target_domain:
-                reward = 0.2  # 同域名，给予小正奖励
-                print(f"🏡 域名完全匹配，给予小正奖励: {reward}")
-                print("="*80 + "\n")
-                return reward
-            elif target_domain in current_domain or current_domain in target_domain:
-                reward = 0.1  # 域名部分匹配
-                print(f"🏘️  域名部分匹配，给予微小正奖励: {reward}")
-                print("="*80 + "\n")
-                return reward
+            # 路径评分 (0-4分)
+            path_score = self._calculate_path_similarity(curr_parsed.path, target_parsed.path)
+            
+            total_similarity = domain_score + path_score
+            return min(total_similarity, 10.0)
+            
         except Exception as e:
-            print(f"🔧 域名解析失败: {e}")
+            print(f"[REWARD] URL解析失败: {e}")
+            # 降级处理：简单字符串匹配
+            if target_url in current_url or current_url in target_url:
+                return 3.0
+            return 0.0
+
+    def _calculate_domain_similarity(self, current_domain: str, target_domain: str) -> float:
+        """
+        计算域名相似度 (0-6分)
+        
+        评分规则：
+        - 完全匹配: 6分
+        - 同主域名不同子域: 4分  
+        - 包含关系: 2分
+        - 无关系: 0分
+        """
+        if not current_domain or not target_domain:
+            return 0.0
+        
+        if current_domain == target_domain:
+            return 6.0
+        
+        # 分割域名部分
+        curr_parts = current_domain.split('.')
+        target_parts = target_domain.split('.')
+        
+        # 检查主域名是否相同 (example.com)
+        if len(curr_parts) >= 2 and len(target_parts) >= 2:
+            curr_main = '.'.join(curr_parts[-2:])
+            target_main = '.'.join(target_parts[-2:])
             
-        # 默认情况，给予小负奖励，鼓励向目标前进
-        reward = -0.05
-        print(f"🚶 默认情况，给予小负奖励鼓励前进: {reward}")
-        print("="*80 + "\n")
-        return reward
+            if curr_main == target_main:
+                return 4.0  # 同主域名，不同子域名
+        
+        # 检查包含关系
+        if target_domain in current_domain or current_domain in target_domain:
+            return 2.0
+        
+        return 0.0
+
+    def _calculate_path_similarity(self, current_path: str, target_path: str) -> float:
+        """
+        计算路径相似度 (0-4分)
+        
+        评分规则：
+        - 路径完全匹配: 4分
+        - 都是根路径: 4分
+        - 基于公共前缀比例: 0-4分
+        - 包含关系: 至少2分
+        """
+        current_path = current_path.strip('/')
+        target_path = target_path.strip('/')
+        
+        if current_path == target_path:
+            return 4.0
+        
+        if not target_path and not current_path:
+            return 4.0  # 都是根路径
+        
+        if not target_path:
+            return 2.0  # 目标是根路径，当前有路径
+        
+        if not current_path:
+            return 1.0  # 当前是根路径，目标有路径
+        
+        # 分割路径段
+        curr_parts = [p for p in current_path.split('/') if p]
+        target_parts = [p for p in target_path.split('/') if p]
+        
+        if not curr_parts or not target_parts:
+            return 1.0
+        
+        # 计算公共前缀
+        common_parts = 0
+        for c, t in zip(curr_parts, target_parts):
+            if c == t:
+                common_parts += 1
+            else:
+                break
+        
+        # 基于公共前缀比例计算相似度
+        similarity_ratio = common_parts / len(target_parts)
+        path_score = similarity_ratio * 4.0
+        
+        # 检查包含关系
+        if target_path in current_path or current_path in target_path:
+            path_score = max(path_score, 2.0)
+        
+        return path_score
+
+
+    # def calculate_reward(
+    #     self,
+    #     current_url: str,
+    #     action_str: str,
+    #     observation: BrowserOutputObservation,
+    # ) -> float:
+    #     """
+    #     0–10 分直接给分：
+    #     • 错误或无效动作立即返回 0
+    #     • 普通阶段：根据 URL 相似度给“过程奖励”= max(sim_cur - sim_prev, 0)
+    #     • <answer> 阶段：若真正到达目标页，再给一次 10 分满分
+    #     """
+    #     # ---------- 安全检查 ----------
+    #     if (not self.current_task or
+    #         not self.current_task.target_url or
+    #         not current_url):
+    #         return 0.0
+
+    #     target_url  = self.current_task.target_url.strip()
+    #     current_url = current_url.strip()
+
+    #     # ---------- ① 处理错误 / 无效动作 ----------
+    #     if observation.error or action_str == "<invalid_action>":
+    #         return 0.0
+
+    #     # ---------- ② 计算 URL“接近度” 0–10 ----------
+    # #     sim_cur = self._url_similarity(current_url, target_url)   # 0–10
+    #     sim_cur = self._url_similarity(current_url, target_url)   # 0–10
+
+    #     # ---------- ③ 如果进入 <answer> 阶段 ----------
+    #     if "<answer>" in action_str:
+    #         # 只有真正到达目标，才给满分；否则给 3 分象征鼓励
+    #         final_reward = 10.0 if current_url == target_url else 3.0
+    #         self._answer_reached = True
+    #         self._prev_similarity = sim_cur     # 更新状态，防止后续误差
+    #         return final_reward
+
+    # #     # ---------- ④ 普通阶段：过程奖励 ----------
+    # #     #   只奖励“越来越接近”的正向增量
+    # #     reward = max(sim_cur - getattr(self, "_prev_similarity", 0.0), 0.0)
+    # #     self._prev_similarity = sim_cur
+    # #     return reward
+    #         # ---------- ④ 普通阶段：过程奖励 ----------
+    #     # ① 基础分：sim_cur 的 10%（确保即便“停在高相似度”也有分）
+    #     # ② 增量分：正向增量 × 90%
+    #     prev = getattr(self, "_prev_similarity", 0.0)
+    #     base      = 0.1 * sim_cur
+    #     increment = 0.9 * max(sim_cur - prev, 0.0)
+    #     reward = base + increment
+
+    #     # 更新状态
+    #     self._prev_similarity = sim_cur
+    #     return reward
+
+
+    # # # ======== 辅助函数 ========
+    # # def _url_similarity(self, cur: str, tgt: str) -> float:
+    # #     """
+    # #     把 URL 拆成域名 + 路径两部分，各自判定：
+    # #     • 域名：完全相同 6 分 / 子域包含 3 分 / 不同 0 分
+    # #     • 路径：按公共前缀段数占比 × 4 分
+    # #     最终结果 ∈ [0, 10]
+    # #     """
+    # #     cur_p = urlparse(cur)
+    # #     tgt_p = urlparse(tgt)
+
+    # #     # ---------- 域名部分 ----------
+    # #     if cur_p.netloc == tgt_p.netloc:
+    # #         domain_score = 6.0
+    # #     elif cur_p.netloc.endswith(tgt_p.netloc) or tgt_p.netloc.endswith(cur_p.netloc):
+    # #         domain_score = 3.0          # 同一主域 + 不同子域
+    # def _url_similarity(self, cur, tgt):
+    #     cur_p, tgt_p = urlparse(cur), urlparse(tgt)
+    #     cur_dom, tgt_dom = cur_p.netloc, tgt_p.netloc
+
+    #     # ① 顶级域相同（比如 example.com vs sub.example.com）
+    #     if cur_dom == tgt_dom:
+    #         domain_score = 6.0
+    #     elif cur_dom.split('.')[-2:] == tgt_dom.split('.')[-2:]:
+    #         domain_score = 2.0    # 同一顶级域，放宽一点
+    #     else:
+    #         domain_score = 0.0
+
+    #     # ---------- 路径部分 ----------
+    #     cur_parts = [p for p in cur_p.path.split('/') if p]
+    #     tgt_parts = [p for p in tgt_p.path.split('/') if p]
+    #     if not tgt_parts:                        # 目标无路径 → 省略比较
+    #         path_score = 4.0 if not cur_parts else 2.0
+    #     else:
+    #         common = 0
+    #         for c, t in zip(cur_parts, tgt_parts):
+    #             if c == t:
+    #                 common += 1
+    #             else:
+    #                 break
+    #         ratio = common / len(tgt_parts)      # 0–1
+    #         path_score = ratio * 4.0             # 0–4
+
+    #     similarity = domain_score + path_score
+    #     return similarity                        # 已天然处于 0–10
+        
 
     def step(self, action_str: str, timeout: float = 100) -> tuple[BrowserOutputObservation, float, bool, dict]:
         """
@@ -501,6 +707,10 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
             ground_truth=task["ground_truth"],
             target_url=task["target_url"],
             )
+        
+        # 初始化过程奖励跟踪变量
+        self._previous_url_similarity = 0.0
+        
         self.agent_side.send(('RESET', None)) # reset the browser to blank page
         start_time = time.time()
         reset_timeout = 120  # 设置超时时间，例如120秒

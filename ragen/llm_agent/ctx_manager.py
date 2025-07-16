@@ -424,6 +424,7 @@ class ContextManager:
                             messages[-1]["content"] += f"State:\n{content['condensed_state']}"
                         else:
                             messages[-1]["content"] += f"State:\n{content['state']}"
+                            # messages[-1]["content"] += f"State:\n{content['condensed_state']}" # for debug only, all observation is condensed
                         
                     if "llm_response" in content:
                         messages.append({"role": "assistant", "content": content["llm_response"]})
@@ -458,6 +459,10 @@ class ContextManager:
             temp_input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
             if len(temp_input_ids) > max_prompt_len:
                 print(f'[DEBUG] truncate prompt, temp_input_ids length: {len(temp_input_ids)}, max_prompt_len: {max_prompt_len}')
+                # NOTE: hardcode
+                with open('./over_length_messages.txt', 'a') as f:
+                    f.write(f'env_id: {env_id}, len(messages): {len(messages)}, len(temp_input_ids): {len(temp_input_ids)}\n')
+                    f.write(f'messages: {messages}\n')
                 last_user_idx = -1
                 # Find the last message from a user，the last turn suppose to be the user turn
                 for i in range(len(messages) - 1, -1, -1):
@@ -465,13 +470,13 @@ class ContextManager:
                         last_user_idx = i
                         break
                 
-                if last_user_idx != -1:
+                if last_user_idx != -1: # 这里找到是最后一个 user turn 正序的 id
                     original_content = messages[last_user_idx]['content']
                     # The state information is expected to be at the end, after "State:\n".
                     # We will truncate the content that follows this marker.
                     split_marker = "State:\n"
                     parts = original_content.rsplit(split_marker, 1)
-
+                    assert len(parts) == 2, f"cannot split the original_content from last user turn by {split_marker}"
                     if len(parts) == 2:
                         base_content, state_content = parts
                         base_content += split_marker  # Restore the marker to the base part
@@ -484,7 +489,10 @@ class ContextManager:
                         base_prompt_ids = self.tokenizer.apply_chat_template(temp_messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
                         remaining_len = max_prompt_len - len(base_prompt_ids)
                         print(f'[DEBUG] env_id: {env_id} remaining_len: {remaining_len}, base_prompt_ids length: {len(base_prompt_ids)}')
-                        if remaining_len > 0:
+                        # 考虑到最大长度截断的同时要保留一些有效的最新观测信息，所以要给remaining_len留一些余量，比如说 30% 的 max_prompt_len，用来展示最新观测信息。
+                        min_cutoff_len = int(max_prompt_len * 0.3)
+                        if remaining_len >= min_cutoff_len: # 剩余 prompt 长度大于 min_cutoff_len，说明有足够的空间来保留最新的观测信息。正常截断最新观测就好。
+                            # 最长长度减去去除最后轮次的观察信息的长度，如果还剩空间，就只对最后观察信息动手 TODO 这里有个问题，剩余的不多可能导致截断的观察信息太少，导致信息丢失。
                             # Tokenize the state and truncate it from the beginning to keep the most recent info
                             cnt = 5
                             while cnt > 0:
@@ -500,16 +508,46 @@ class ContextManager:
                             # Reconstruct the final content for the last user message
                             messages[last_user_idx]['content'] = base_content + truncated_state_content
                         else:
-                            # If there's no space for the state, truncate it completely
-                            # TODO 这里也很有问题啊，如果前面内容太长，这里也很容易超长。 64K 训练很必要，或者截断前面的历史
-                            messages[last_user_idx]['content'] = base_content
+                            # 如果没有足够的空间剩余给最新的观测，再保留第一个 system，user 轮次后，逐次移除一对 assistant，user 轮次，直到剩余空间足够。
+                            while len(temp_messages) >= 4:  # 最少要保留这几个轮次： system，user_0, [assistant_0, user_1, ... (这里都是可删的)] assistant_n-1, user_n
+                                # Remove one pair: assistant (at index 2) and the following user (at new index 2)
+                                temp_messages.pop(2) # remove first assistant turn
+                                temp_messages.pop(2) # remove second user turn
+                                last_user_idx -= 2 # update the last user turn index
+
+                                base_prompt_ids = self.tokenizer.apply_chat_template(temp_messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
+                                remaining_len = max_prompt_len - len(base_prompt_ids)
+                                if remaining_len >= min_cutoff_len:
+                                    break
+                            # while 循环跳出有两种情况，一种是 break 跳出，剪除 history 轮次后，剩余空间足够满足信息展示的要求。一种是 while 循环结束，说明 history 轮次都剪除了，剩余空间还是不够充分，但同时也分两种情况，一个是remaining_len > 0, 还有一种情况是 remaining_len <= 0。第二种情况在使用 32k 长度训练的时候出现的可能性应该不大，直接 raise 就好了
+
+                            # After attempting to free up space, truncate the observation to fit whatever is available.
+                            if remaining_len > 0:
+                                cnt = 5
+                                while cnt > 0:
+                                    state_ids = self.tokenizer.encode(state_content)
+                                    truncated_state_ids = state_ids[-remaining_len:]
+                                    print(f'[DEBUG] env_id: {env_id} (history removed) truncated_state_ids length: {len(truncated_state_ids)} in cnt: {cnt}')
+                                    truncated_state_content = self.tokenizer.decode(truncated_state_ids, skip_special_tokens=True)
+                                    truncated_state_content_ids = self.tokenizer.encode(truncated_state_content)
+                                    if len(truncated_state_content_ids) <= remaining_len:
+                                        break
+                                    state_content = truncated_state_content
+                                    cnt -= 1
+                                temp_messages[last_user_idx]['content'] = base_content + truncated_state_content
+                                messages = temp_messages
+                            else:
+                                raise ValueError(f'[DEBUG] env_id: {env_id} - Context length exceeded for base content even after removing all history. Observation dropped.')
+
+
                         tmp_input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
                         print(f'[DEBUG] env_id: {env_id} before truncate length: {len(temp_input_ids)} after truncate length: {len(tmp_input_ids)}')
+
                 else:
-                    print(f'[DEBUG] last_user_idx: {last_user_idx}, last turn in messages is not user turn')
+                    raise ValueError(f'[DEBUG] last_user_idx: {last_user_idx}, last turn in messages is not user turn')
 
             text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=False)
-            print(f'[DEBUG] env_id: {env_id} tokenized temp_input_ids length : {len(temp_input_ids)} text length after: {len(text)}')
+            print(f'[DEBUG] env_id: {env_id} tokenized temp_input_ids length : {len(temp_input_ids)}.')
             # print(f'[DEBUG] messages: {messages}')
             # print(f'[DEBUG] text: {text}')
             if not prepare_for_update: # 这里的逻辑不影响 async rollout
@@ -524,12 +562,55 @@ class ContextManager:
         input_ids, attention_mask = inputs.input_ids, inputs.attention_mask
         position_ids = attention_mask.cumsum(dim=-1)
         if prepare_for_update:
+            # 提取每轨迹每轮的reward
             scores = [[i['reward'] for i in env_output['history']] for env_output in env_outputs]
-            score_tensor, loss_mask, response_mask = get_masks_and_scores(input_ids, self.tokenizer, scores, use_turn_scores=self.config.agent_proxy.use_turn_scores, enable_response_mask=self.config.enable_response_mask) # 这种 Step 级别的 reward 后面再想想到底怎么搞吧。
+            
+            # use_turn_scores的调试信息
+            if self.config.agent_proxy.use_turn_scores:
+                print(f"🎯 [USE_TURN_SCORES] 启用按轮次分配奖励模式")
+                
+                # 打印每个轨迹的奖励分布
+                for i, env_output in enumerate(env_outputs):
+                    history = env_output['history']
+                    print(f"🔍 [轨迹{i}] 共{len(history)}轮，每轮奖励: {scores[i]}")
+                    
+                    # 检查奖励数量是否与history长度匹配
+                    reward_count = len([h for h in history if 'reward' in h])
+                    if len(scores[i]) != reward_count:
+                        print(f"⚠️ [警告] 轨迹{i}: 奖励数量({len(scores[i])})与包含奖励的轮次数量({reward_count})不匹配")
+                    
+                    # 验证每个奖励值是否合理
+                    for j, reward in enumerate(scores[i]):
+                        if reward < 0 or reward > 10:
+                            print(f"⚠️ [警告] 轨迹{i}轮次{j}: 奖励值{reward}超出合理范围[0,10]")
+                
+                print(f"📊 [USE_TURN_SCORES] 最终scores矩阵形状: {len(scores)}x{[len(s) for s in scores]}")
+            
+            score_tensor, loss_mask, response_mask = get_masks_and_scores(
+                input_ids, 
+                self.tokenizer, 
+                scores, 
+                use_turn_scores=self.config.agent_proxy.use_turn_scores, 
+                enable_response_mask=self.config.enable_response_mask
+            )
 
             normalized_score_tensor = score_tensor
             if not self.config.agent_proxy.use_turn_scores:
+                # 只有在use_turn_scores=False时才进行归一化
                 normalized_score_tensor = self._normalize_score_tensor(score_tensor, env_outputs)
+            else:
+                # use_turn_scores=True时跳过归一化，保持每轮奖励的原始值
+                print(f"🎯 [USE_TURN_SCORES] 跳过归一化，保持每轮奖励的原始值")
+                print(f"🎯 [USE_TURN_SCORES] Score tensor形状: {score_tensor.shape}")
+                print(f"🎯 [USE_TURN_SCORES] 非零奖励位置数量: {(score_tensor != 0).sum()}")
+                
+                # 打印每个轨迹的奖励分布（仅前3个轨迹，避免日志过多）
+                for i in range(min(3, score_tensor.shape[0])):
+                    non_zero_positions = torch.nonzero(score_tensor[i]).flatten()
+                    non_zero_values = score_tensor[i][non_zero_positions]
+                    print(f"🔍 [轨迹{i}] 奖励位置: {non_zero_positions.tolist()}")
+                    print(f"🔍 [轨迹{i}] 奖励数值: {non_zero_values.tolist()}")
+                
             response_length = response_mask.sum(dim=-1).float().mean().item()
 
         llm_inputs = DataProto()
@@ -644,68 +725,81 @@ class ContextManager:
         scores = [grep_score(text) for text in responses]
         return scores
     
-    def update_eval_score(self, rollouts: DataProto, eval_lm_outputs: DataProto, env_outputs: List[Dict]):
+    def update_eval_score(self,rollouts: DataProto,eval_lm_outputs: DataProto,env_outputs: List[Dict]):
         """
-        Update the reward tensor with the LLM reward scores.
-        现在同时考虑step-level reward和LLM评分
+        将step-level奖励和LLM终局评分独立分配，不进行融合。
+        
+        策略：
+            1. 过程reward：已通过use_turn_scores=True分配到各轮次最后token
+            2. LLM评分：独立分配到整个序列的最后token
+            3. 两种奖励信号不融合，保持独立
         """
-        llm_scores = self.get_eval_score(eval_lm_outputs) # 对于每个轨迹最终输出得分
-        input_ids = rollouts.batch['input_ids']
-        
-        # 首先获取现有的step-level rewards
-        existing_score_tensor = rollouts.batch.get('rm_scores', torch.zeros_like(input_ids, dtype=torch.float32))
-        print(f"🔄 [REWARD融合] 现有step-level reward tensor形状: {existing_score_tensor.shape}")
-        
-        # 创建新的score tensor，保留现有的step-level rewards
-        score_tensor = existing_score_tensor.clone()
-        
-        # 在最后一个token位置添加LLM评分（加权组合）
-        step_final_scores = score_tensor[:, -1].clone()  # 获取最后一步的step-level reward
-        llm_final_scores = torch.tensor(llm_scores, dtype=torch.float32)
-        
-        # 加权组合：70%step-level reward + 30%LLM评分
-        # 您可以通过配置文件调整这个权重
-        step_weight = getattr(self.config.agent_proxy, 'step_reward_weight', 0.7)
-        llm_weight = getattr(self.config.agent_proxy, 'llm_reward_weight', 0.3)
-        
-        # 确保权重和为1
-        total_weight = step_weight + llm_weight
-        if total_weight > 0:
-            step_weight = step_weight / total_weight
-            llm_weight = llm_weight / total_weight
-        else:
-            step_weight, llm_weight = 0.7, 0.3
+
+        # 获取LLM评分
+        llm_scores = self.get_eval_score(eval_lm_outputs)             # list[float]  len=B (0-10分)
+        input_ids  = rollouts.batch["input_ids"]                      # (B, L) LongTensor
+        B, L = input_ids.shape
+
+        print(f"🎯 [独立奖励分配] 处理 {B} 条轨迹的奖励")
+        print(f"🎯 [独立奖励分配] LLM评分: {llm_scores}")
+
+        # 获取step-level rewards（已通过use_turn_scores分配到各轮次）
+        if "rm_scores" in rollouts.batch:
+            step_reward_tensor = rollouts.batch["rm_scores"]          # (B, L-1) 已分配的step奖励
+            print(f"🔄 [独立奖励分配] step_reward_tensor.shape={step_reward_tensor.shape}")
             
-        combined_scores = step_weight * step_final_scores + llm_weight * llm_final_scores
-        
-        print(f"📊 [REWARD融合] Step-level最终分数: {step_final_scores.tolist()}")
-        print(f"📊 [REWARD融合] LLM评分: {llm_final_scores.tolist()}")
-        print(f"📊 [REWARD融合] 组合后分数: {combined_scores.tolist()}")
-        print(f"📊 [REWARD融合] 权重配置: step={step_weight}, llm={llm_weight}")
-        
-        score_tensor[:, -1] = combined_scores
-        score_tensor = score_tensor[:, 1:] # remove the first token
-        normalized_score_tensor = self._normalize_score_tensor(score_tensor, env_outputs)
-        rollouts.batch['llm_reward_scores'] = normalized_score_tensor
-        print(f'[DEBUG] rollouts.batch["llm_reward_scores"][:, -1]: {rollouts.batch["llm_reward_scores"][:, -1]}')
-        
-        # 同时保存原始的step-level rewards以便调试
-        rollouts.batch['step_level_rewards'] = existing_score_tensor[:, 1:]
-        rollouts.batch['pure_llm_scores'] = torch.zeros_like(input_ids, dtype=torch.float32)
-        rollouts.batch['pure_llm_scores'][:, -1] = llm_final_scores
-        rollouts.batch['pure_llm_scores'] = rollouts.batch['pure_llm_scores'][:, 1:]
-        
-        # 打印最终的DataProto结构确认
-        print(f"🔍 [最终DATAPROTO] rollouts.batch的所有键: {list(rollouts.batch.keys())}")
-        print(f"🔍 [最终DATAPROTO] 是否包含rm_scores: {'rm_scores' in rollouts.batch}")
-        print(f"🔍 [最终DATAPROTO] 是否包含llm_reward_scores: {'llm_reward_scores' in rollouts.batch}")
-        print(f"🔍 [最终DATAPROTO] 最终使用的reward字段应该是: llm_reward_scores")
-        
+            # 创建LLM评分tensor，只在最后token位置有值
+            llm_reward_tensor = torch.zeros_like(step_reward_tensor)   # (B, L-1)
+            llm_final_scores = torch.as_tensor(llm_scores,
+                                              dtype=step_reward_tensor.dtype,
+                                              device=step_reward_tensor.device)  # (B,)
+            llm_reward_tensor[:, -1] = llm_final_scores              # 只在最后token放LLM评分
+            
+            print(f"📊 [独立奖励分配] Step奖励（各轮次）:")
+            for i in range(min(3, B)):  # 只打印前3个轨迹避免日志过多
+                step_nonzero = torch.nonzero(step_reward_tensor[i]).flatten()
+                step_values = step_reward_tensor[i][step_nonzero]
+                print(f"    轨迹{i}: 位置{step_nonzero.tolist()} = {step_values.tolist()}")
+            
+            print(f"📊 [独立奖励分配] LLM评分（最后token）: {llm_final_scores.tolist()}")
+            
+            # 分别保存两种奖励信号
+            rollouts.batch["step_reward_scores"] = step_reward_tensor  # 过程奖励
+            rollouts.batch["llm_reward_scores"] = llm_reward_tensor   # LLM终局评分
+            
+            # 如果需要归一化，可以分别对两种奖励进行
+            if not self.config.agent_proxy.use_turn_scores:
+                # 只有在use_turn_scores=False时才对step奖励归一化
+                normalized_step = self._normalize_score_tensor(step_reward_tensor, env_outputs)
+                rollouts.batch["step_reward_scores"] = normalized_step
+            
+            # LLM评分可选择是否归一化（通常LLM评分已经是标准化的0-10分）
+            # 这里保持原始分数，不做归一化
+            
+            # 保存调试信息
+            rollouts.batch["original_step_rewards"] = step_reward_tensor.clone()
+            rollouts.batch["original_llm_scores"] = llm_reward_tensor.clone()
+            
+        else:
+            print("⚠️ [独立奖励分配] 未找到step-level rewards!")
+            # 如果没有step奖励，只分配LLM评分
+            llm_reward_tensor = torch.zeros(B, L-1, dtype=torch.float32, device=input_ids.device)
+            llm_final_scores = torch.as_tensor(llm_scores, dtype=torch.float32, device=input_ids.device)
+            llm_reward_tensor[:, -1] = llm_final_scores
+            
+            rollouts.batch["step_reward_scores"] = torch.zeros_like(llm_reward_tensor)
+            rollouts.batch["llm_reward_scores"] = llm_reward_tensor
+
+        print(f"✅ [独立奖励分配] 完成独立分配:")
+        print(f"   📈 Step奖励: 分配到各轮次最后token")  
+        print(f"   📋 LLM评分: 分配到序列最后token")
+        print(f"   🔗 两种信号独立，无融合")
+
         return rollouts
 
+
+ 
     
-
-
 
 @hydra.main(version_base = None, config_path = "../../config", config_name = "base")
 def main(config):

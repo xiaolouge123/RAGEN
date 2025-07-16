@@ -536,6 +536,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                         batch = asyncio.run_coroutine_threadsafe(self.agent_proxy.async_rollout(batch, val=False, global_step=self.global_steps, total_steps=self.total_training_steps), self.async_rollout_loop)
                         batch = batch.result()
                         self.async_rollout_manager.sleep()
+                        print(f"[DEBUG] batch.input_ids.shape: {batch.batch['input_ids'].shape}")
 
                     batch, metrics = _filter_rollout(batch)
                     metrics.update({"train/" + key: value for key, value in batch.meta_info["metrics"].items()})

@@ -37,6 +37,8 @@ from verl.workers.actor import BasePPOActor
 
 from peft import PeftModel
 
+from torch.nn.utils import clip_grad_norm_
+
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -369,6 +371,7 @@ class DataParallelPPOActor(BasePPOActor):
                         data["actor/entropy_loss"] = entropy_loss.detach().item()
                     append_to_dict(metrics, data)
 
+                # 梯度裁剪和优化器更新
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
             append_to_dict(metrics, data)
