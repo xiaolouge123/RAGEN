@@ -9,7 +9,9 @@ import concurrent.futures
 import hydra
 import os
 import re
+import torch
 import time
+import pickle
 import numpy as np
 import random
 from typing import List, Dict, Any
@@ -273,7 +275,7 @@ class LLMAgentProxy:
 
     async def async_eval_generate_sequences(self, lm_inputs: DataProto):
         if isinstance(self.llm_reward_model_wg, EvalApiCallingWrapperWg):
-            lm_outputs = await self.llm_reward_model_wg.async_generate_sequences(lm_inputs)
+            lm_outputs = await self.llm_reward_model_wg.async_generate_sequences(lm_inputs, mock=False)
         else:
             raise ValueError(f"Unsupported llm reward model worker type: {type(self.llm_reward_model_wg)}")
         return lm_outputs
@@ -285,7 +287,7 @@ class LLMAgentProxy:
             raise ValueError(f"Unsupported llm reward model worker type: {type(self.llm_reward_model_wg)}")
         return lm_outputs
 
-    async def async_rollout(self, dataproto: DataProto, val=False, global_step=0, total_steps=0):
+    async def async_rollout(self, dataproto: DataProto, val=False, global_step=0, total_steps=0, load_rollout_cache=False):
         """
         异步多轮 rollout 的实现。
         每个环境的 rollout 独立进行，并行进行。不在通过 config.agent_proxy.max_turn 环境交互的步频。
@@ -315,9 +317,23 @@ class LLMAgentProxy:
         async def interact_loop_callback(
             env_id, env_output, es_manager, ctx_manager, max_turn
         ):
+            import time
+
+            start_time = time.time()
+            rollout_timeout_s = self.config.agent_proxy.get("rollout_timeout_s", 600)
+            max_consecutive_invalid_action_failure = self.config.agent_proxy.get("max_consecutive_invalid_action_failure", 3)
+            consecutive_invalid_action_failure_cnt = 0
+
             if env_id == 0:
                 print(f"[DEBUG] Start Async Rollout for env_id: {env_id}")
             for i in range(max_turn):  # 外部限制一下交互环境的最大轮次
+                # 最大交互超时时间，超时后截断结束循环
+                if time.time() - start_time > rollout_timeout_s: 
+                    print(
+                        f"[WARN] env_id: {env_id} rollout timed out after {time.time() - start_time:.2f}s (limit: {rollout_timeout_s}s)."
+                    )
+                    break
+
                 if env_id == 0:
                     print(f"[DEBUG] Async Rollout for env_id: {env_id} turn {i}")
                 lm_inputs: DataProto = ctx_manager.get_lm_inputs(
@@ -354,6 +370,16 @@ class LLMAgentProxy:
                 )
 
                 env_inputs: List[Dict] = ctx_manager.get_env_inputs(lm_outputs)
+                # 如果有连续的动作错误，就截断提前截断 rollout
+                if len(env_inputs) == 1 and \
+                    (len(env_inputs[0].get("actions", [])) == 0 and not env_inputs[0].get("final_answer", None)):
+                    consecutive_invalid_action_failure_cnt += 1
+                else:
+                    consecutive_invalid_action_failure_cnt = 0
+                
+                if consecutive_invalid_action_failure_cnt >= max_consecutive_invalid_action_failure:
+                    print(f"[DEBUG] env_id: {env_id} consecutive invalid action failure cnt: {consecutive_invalid_action_failure_cnt} >= max_consecutive_invalid_action_failure: {max_consecutive_invalid_action_failure}, break")
+                    break
                 # for env_input in env_inputs:
                 #     if env_input.get("final_answer", ''):
                 #         print(f"[DEBUG] Aha, env_id {env_id} has final answer: {env_input['final_answer']}")
@@ -368,32 +394,53 @@ class LLMAgentProxy:
                     break
 
                 env_output = es_manager.rollout_cache[env_id]
-
-        s_time = time.time()
-        print(f"[DEBUG] Start Async Rollout.")
+        
+        
         max_turn = self.config.agent_proxy.max_turn
         es_manager = self.val_es_manager if val else self.train_es_manager
         ctx_manager = self.val_ctx_manager if val else self.train_ctx_manager
-        env_outputs = es_manager.reset(global_step=global_step, total_steps=total_steps)
-        rollout_tasks = []
-        for env_output in env_outputs:
-            rollout_tasks.append(
-                asyncio.create_task(
-                    interact_loop_callback(
-                        env_output["env_id"],
-                        env_output,
-                        es_manager,
-                        ctx_manager,
-                        max_turn,
+
+        rollout_cache = []
+        if load_rollout_cache:
+            print(f"[DEBUG] Load rollout cache from {load_rollout_cache}")
+            if os.path.exists('./rollout_cache.pkl'):
+                with open('./rollout_cache.pkl', 'rb') as f:
+                    rollout_cache = pickle.load(f)
+                print(f"[DEBUG] Load rollout cache length: {len(rollout_cache)}")
+            else:
+                print(f"[DEBUG] Rollout cache not found")
+                rollout_cache = []
+        
+        if len(rollout_cache) == 0:
+            s_time = time.time()
+            print(f"[DEBUG] Start Async Rollout.")
+            env_outputs = es_manager.reset(global_step=global_step, total_steps=total_steps, val=val)
+            rollout_tasks = []
+            for env_output in env_outputs:
+                rollout_tasks.append(
+                    asyncio.create_task(
+                        interact_loop_callback(
+                            env_output["env_id"],
+                            env_output,
+                            es_manager,
+                            ctx_manager,
+                            max_turn,
+                        )
                     )
                 )
-            )
-        await asyncio.gather(*rollout_tasks)
-        print(f"[DEBUG] Async Rollout tasks finished.")
-        e_time = time.time()
-        print(f"[DEBUG] Async Rollout tasks finished in {e_time - s_time} seconds.")
+            await asyncio.gather(*rollout_tasks)
+            print(f"[DEBUG] Async Rollout tasks finished.")
+            e_time = time.time()
+            print(f"[DEBUG] Async Rollout tasks finished in {e_time - s_time} seconds.")
+            rollout_states = es_manager.get_rollout_states()
+            if load_rollout_cache:
+                with open('./rollout_cache.pkl', 'wb') as f:
+                    pickle.dump(rollout_states, f)
+                print(f"[DEBUG] Save rollout cache to ./rollout_cache.pkl")
+        else:
+            rollout_states = rollout_cache
 
-        rollout_states = es_manager.get_rollout_states()
+        
         print(f"[DEBUG] async rollout_states[0]: {rollout_states[0]}")
         rollouts = ctx_manager.formulate_rollouts(rollout_states) 
         if self.llm_reward_model_wg:
@@ -404,10 +451,11 @@ class LLMAgentProxy:
             rollouts = ctx_manager.update_eval_score(
                 rollouts, eval_lm_outputs, rollout_states
             )
-            print(f'[DEBUG] rollouts loss_mask: {rollouts.batch["loss_mask"]}')
+            
             print(f'[DEBUG] rollouts rm_scores: {rollouts.batch["rm_scores"]}')
             print(f'[DEBUG] rollouts original_rm_scores: {rollouts.batch["original_rm_scores"]}')
             print(f'[DEBUG] rollouts llm_reward_scores: {rollouts.batch["llm_reward_scores"]}')
+            print(f'[DEBUG] rollouts loss_mask: {rollouts.batch["loss_mask"]}')
 
         trajectories = self.tokenizer.batch_decode(
             rollouts.batch["input_ids"], skip_special_tokens=False

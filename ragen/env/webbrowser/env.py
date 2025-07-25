@@ -187,7 +187,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
                         # reset 后也没必要给外面看空白页
                         obs, info = env.reset()
                         # TODO 考虑封装一下
-                        html_str = flatten_dom_to_str(obs['dom_object']) # 
+                        html_str = flatten_dom_to_str(obs['dom_object'])
                         obs['text_content'] = self.html_text_converter.handle(html_str)
                         # make observation serializable
                         obs['set_of_marks'] = self.image_to_png_base64_url(
@@ -211,7 +211,7 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
 
                     # TODO 考虑封装一下
                     # add text content of the page
-                    html_str = flatten_dom_to_str(obs['dom_object']) # 
+                    html_str = flatten_dom_to_str(obs['dom_object'])
                     obs['text_content'] = self.html_text_converter.handle(html_str)
                     # make observation serializable
                     obs['set_of_marks'] = self.image_to_png_base64_url(
@@ -367,9 +367,13 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
     def reset(self, seed: Optional[int] = None, **kwargs: any) -> Any:
         global_step = kwargs.get("global_step", 0)
         total_steps = kwargs.get("total_steps", 0)
+        val = kwargs.get("val", False)
         progress = global_step / total_steps if total_steps > 0 else 0
-        inv_progress = min(1 - progress, 0.5)
+        inv_progress = min(1 - progress, 0.1)
         dummy_task = random.random() < inv_progress
+        if val:
+            # validation 模式下，不使用 dummy_task
+            dummy_task = False
         
         with all_seed(seed):
             self.current_task_idx = random.randint(0, len(self.data['train']) - 1)

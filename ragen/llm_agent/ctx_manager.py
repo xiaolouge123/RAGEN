@@ -424,6 +424,7 @@ class ContextManager:
                             messages[-1]["content"] += f"State:\n{content['condensed_state']}"
                         else:
                             messages[-1]["content"] += f"State:\n{content['state']}"
+                            # messages[-1]["content"] += f"State:\n{content['condensed_state']}" # for debug only, all observation is condensed
                         
                     if "llm_response" in content:
                         messages.append({"role": "assistant", "content": content["llm_response"]})
@@ -454,6 +455,10 @@ class ContextManager:
             temp_input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
             if len(temp_input_ids) > max_prompt_len:
                 print(f'[DEBUG] truncate prompt, temp_input_ids length: {len(temp_input_ids)}, max_prompt_len: {max_prompt_len}')
+                # NOTE: hardcode
+                with open('./over_length_messages.txt', 'a') as f:
+                    f.write(f'env_id: {env_id}, len(messages): {len(messages)}, len(temp_input_ids): {len(temp_input_ids)}\n')
+                    f.write(f'messages: {messages}\n')
                 last_user_idx = -1
                 # Find the last message from a user，the last turn suppose to be the user turn
                 for i in range(len(messages) - 1, -1, -1):
@@ -461,13 +466,13 @@ class ContextManager:
                         last_user_idx = i
                         break
                 
-                if last_user_idx != -1:
+                if last_user_idx != -1: # 这里找到是最后一个 user turn 正序的 id
                     original_content = messages[last_user_idx]['content']
                     # The state information is expected to be at the end, after "State:\n".
                     # We will truncate the content that follows this marker.
                     split_marker = "State:\n"
                     parts = original_content.rsplit(split_marker, 1)
-
+                    assert len(parts) == 2, f"cannot split the original_content from last user turn by {split_marker}"
                     if len(parts) == 2:
                         base_content, state_content = parts
                         base_content += split_marker  # Restore the marker to the base part
@@ -480,12 +485,16 @@ class ContextManager:
                         base_prompt_ids = self.tokenizer.apply_chat_template(temp_messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
                         remaining_len = max_prompt_len - len(base_prompt_ids)
                         print(f'[DEBUG] env_id: {env_id} remaining_len: {remaining_len}, base_prompt_ids length: {len(base_prompt_ids)}')
-                        if remaining_len > 0:
+                        # 考虑到最大长度截断的同时要保留一些有效的最新观测信息，所以要给remaining_len留一些余量，比如说 30% 的 max_prompt_len，用来展示最新观测信息。
+                        min_cutoff_len = int(max_prompt_len * 0.3)
+                        if remaining_len >= min_cutoff_len: # 剩余 prompt 长度大于 min_cutoff_len，说明有足够的空间来保留最新的观测信息。正常截断最新观测就好。
+                            # 最长长度减去去除最后轮次的观察信息的长度，如果还剩空间，就只对最后观察信息动手 TODO 这里有个问题，剩余的不多可能导致截断的观察信息太少，导致信息丢失。
                             # Tokenize the state and truncate it from the beginning to keep the most recent info
                             cnt = 5
                             while cnt > 0:
                                 state_ids = self.tokenizer.encode(state_content)
-                                truncated_state_ids = state_ids[-remaining_len:]
+                                # Keep the beginning of the observation, truncate the tail.
+                                truncated_state_ids = state_ids[:remaining_len]
                                 print(f'[DEBUG] env_id: {env_id} truncated_state_ids length: {len(truncated_state_ids)} in cnt: {cnt}')
                                 truncated_state_content = self.tokenizer.decode(truncated_state_ids, skip_special_tokens=True)
                                 truncated_state_content_ids = self.tokenizer.encode(truncated_state_content)
@@ -496,16 +505,47 @@ class ContextManager:
                             # Reconstruct the final content for the last user message
                             messages[last_user_idx]['content'] = base_content + truncated_state_content
                         else:
-                            # If there's no space for the state, truncate it completely
-                            # TODO 这里也很有问题啊，如果前面内容太长，这里也很容易超长。 64K 训练很必要，或者截断前面的历史
-                            messages[last_user_idx]['content'] = base_content
+                            # 如果没有足够的空间剩余给最新的观测，再保留第一个 system，user 轮次后，逐次移除一对 assistant，user 轮次，直到剩余空间足够。
+                            while len(temp_messages) > 4:  # 最少要保留这几个轮次： system，user_0, [assistant_0, user_1, ... (这里都是可删的)] assistant_n-1, user_n
+                                # Remove one pair: assistant (at index 2) and the following user (at new index 2)
+                                temp_messages.pop(2) # remove first assistant turn
+                                temp_messages.pop(2) # remove second user turn
+                                last_user_idx -= 2 # update the last user turn index
+
+                                base_prompt_ids = self.tokenizer.apply_chat_template(temp_messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
+                                remaining_len = max_prompt_len - len(base_prompt_ids)
+                                if remaining_len >= min_cutoff_len:
+                                    break
+                            # while 循环跳出有两种情况，一种是 break 跳出，剪除 history 轮次后，剩余空间足够满足信息展示的要求。一种是 while 循环结束，说明 history 轮次都剪除了，剩余空间还是不够充分，但同时也分两种情况，一个是remaining_len > 0, 还有一种情况是 remaining_len <= 0。第二种情况在使用 32k 长度训练的时候出现的可能性应该不大，直接 raise 就好了
+
+                            # After attempting to free up space, truncate the observation to fit whatever is available.
+                            if remaining_len > 0:
+                                cnt = 5
+                                while cnt > 0:
+                                    state_ids = self.tokenizer.encode(state_content)
+                                    # Keep the beginning of the observation, truncate the tail.
+                                    truncated_state_ids = state_ids[:remaining_len]
+                                    print(f'[DEBUG] env_id: {env_id} (history removed) truncated_state_ids length: {len(truncated_state_ids)} in cnt: {cnt}')
+                                    truncated_state_content = self.tokenizer.decode(truncated_state_ids, skip_special_tokens=True)
+                                    truncated_state_content_ids = self.tokenizer.encode(truncated_state_content)
+                                    if len(truncated_state_content_ids) <= remaining_len:
+                                        break
+                                    state_content = truncated_state_content
+                                    cnt -= 1
+                                temp_messages[last_user_idx]['content'] = base_content + truncated_state_content
+                                messages = temp_messages
+                            else:
+                                raise ValueError(f'[DEBUG] env_id: {env_id} - Context length exceeded for base content even after removing all history. Observation dropped.')
+
+
                         tmp_input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=True)
                         print(f'[DEBUG] env_id: {env_id} before truncate length: {len(temp_input_ids)} after truncate length: {len(tmp_input_ids)}')
+
                 else:
-                    print(f'[DEBUG] last_user_idx: {last_user_idx}, last turn in messages is not user turn')
+                    raise ValueError(f'[DEBUG] last_user_idx: {last_user_idx}, last turn in messages is not user turn')
 
             text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=(not prepare_for_update), tokenize=False)
-            print(f'[DEBUG] env_id: {env_id} tokenized temp_input_ids length : {len(temp_input_ids)} text length after: {len(text)}')
+            print(f'[DEBUG] env_id: {env_id} tokenized temp_input_ids length : {len(temp_input_ids)}.')
             # print(f'[DEBUG] messages: {messages}')
             # print(f'[DEBUG] text: {text}')
             if not prepare_for_update: # 这里的逻辑不影响 async rollout
