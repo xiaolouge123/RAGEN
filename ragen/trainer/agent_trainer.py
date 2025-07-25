@@ -5,6 +5,7 @@ Adapted from the excellently written verl implementation.
 
 import asyncio
 import json
+import time
 import os
 import uuid
 from collections import defaultdict
@@ -533,17 +534,22 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                     else:
                         print(f"[DEBUG] enter async rollout")
                         self.async_rollout_manager.wake_up()
-                        batch = asyncio.run_coroutine_threadsafe(self.agent_proxy.async_rollout(batch, val=False, global_step=self.global_steps, total_steps=self.total_training_steps), self.async_rollout_loop)
+                        load_rollout_cache = self.config.trainer.get("load_rollout_cache", False)
+                        batch = asyncio.run_coroutine_threadsafe(self.agent_proxy.async_rollout(batch, val=False, global_step=self.global_steps, total_steps=self.total_training_steps, load_rollout_cache=load_rollout_cache), self.async_rollout_loop)
                         batch = batch.result()
                         self.async_rollout_manager.sleep()
+                        # print(f"[DEBUG] sleep for 10 seconds after async rollout")
+                        # time.sleep(10) # 停 10 秒, 看看 inference engine 是否正常 offload
+                        print(f"[DEBUG] batch.input_ids.shape: {batch.batch['input_ids'].shape}")
 
                     batch, metrics = _filter_rollout(batch)
                     metrics.update({"train/" + key: value for key, value in batch.meta_info["metrics"].items()})
 
                     inputs, outputs, scores = _process_batch_for_logging(batch)
                     # self._maybe_log_generations(inputs=inputs, outputs=outputs, scores=scores, _type="train")
-
-
+                    # # DEBUG ONLY on forward log prob nan bug
+                    # self.actor_rollout_wg.debug_forward_pass()
+                    # print("!!!!!!!!!! DEBUG TEST COMPLETE, EXITING... !!!!!!!!!!")
 
 
 
@@ -619,6 +625,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                 # compute values
                 if self.use_critic:
+                    print(f"[DEBUG] use_critic: {self.use_critic}")
                     with _timer("values", timing_raw):
                         values = self.critic_wg.compute_values(batch)
                         batch = batch.union(values)
@@ -656,6 +663,25 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                         high_level_gamma=self.config.algorithm.high_level_gamma,
                         bi_level_gae=self.config.algorithm.bi_level_gae,
                     )
+
+                # # Normalize advantages to prevent gradient explosion. This is a standard trick.
+                # adv_tensor = batch.batch["advantages"]
+                # # The tensor must have more than 1 element to compute std, and must not be empty.
+                # if adv_tensor.numel() > 1:
+                #     # --- [DEBUG] Log before normalization ---
+                #     print("\n--- [DEBUG] Advantage Stats (BEFORE Normalization) ---")
+                #     print(f"--- [DEBUG] Shape: {adv_tensor.shape}")
+                #     print(f"--- [DEBUG] Min: {adv_tensor.min().item():.4f}, Max: {adv_tensor.max().item():.4f}, Mean: {adv_tensor.mean().item():.4f}, Std: {adv_tensor.std().item():.4f}")
+                #     print(f"--- [DEBUG] Contains NaN: {torch.isnan(adv_tensor).any().item()}, Contains Inf: {torch.isinf(adv_tensor).any().item()}")
+                    # ------------------------------------------
+
+                    # adv_tensor = (adv_tensor - adv_tensor.mean()) / (adv_tensor.std() + 1e-8)
+                    # batch.batch["advantages"] = adv_tensor
+
+                    # # --- [DEBUG] Log after normalization ---
+                    # print("--- [DEBUG] Advantage Stats (AFTER Normalization) ---")
+                    # print(f"--- [DEBUG] Min: {adv_tensor.min().item():.4f}, Max: {adv_tensor.max().item():.4f}, Mean: {adv_tensor.mean().item():.4f}, Std: {adv_tensor.std().item():.4f}")
+                    # print("------------------------------------------\n")
 
                 ##### A very different setting, just here for testing: Can I normalize the advantages to have a mean of 0?
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO and self.config.grpo_advantage_length_weight:
