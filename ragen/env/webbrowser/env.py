@@ -367,9 +367,13 @@ class WebBrowserEnv(BaseLanguageBasedEnv):
     def reset(self, seed: Optional[int] = None, **kwargs: any) -> Any:
         global_step = kwargs.get("global_step", 0)
         total_steps = kwargs.get("total_steps", 0)
+        val = kwargs.get("val", False)
         progress = global_step / total_steps if total_steps > 0 else 0
         inv_progress = min(1 - progress, 0.1)
         dummy_task = random.random() < inv_progress
+        if val:
+            # validation 模式下，不使用 dummy_task
+            dummy_task = False
         
         with all_seed(seed):
             self.current_task_idx = random.randint(0, len(self.data['train']) - 1)
