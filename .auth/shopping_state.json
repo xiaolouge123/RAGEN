@@ -1,0 +1,173 @@
+{
+    "cookies": [
+        {
+            "name": "mage-cache-storage",
+            "value": "{}",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874721,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "mage-cache-storage-section-invalidation",
+            "value": "{}",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874721,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "mage-cache-sessid",
+            "value": "true",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874728,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "mage-messages",
+            "value": "",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874728,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Strict"
+        },
+        {
+            "name": "recently_viewed_product",
+            "value": "{}",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874721,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "recently_viewed_product_previous",
+            "value": "{}",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874721,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "recently_compared_product",
+            "value": "{}",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874721,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "recently_compared_product_previous",
+            "value": "{}",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874721,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "product_data_storage",
+            "value": "{}",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874721,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "private_content_version",
+            "value": "279986160099fd9642aa03f875083da0",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1787898725.718227,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "PHPSESSID",
+            "value": "e6a46a71f4feb77916601d82744730ed",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874728.753167,
+            "httpOnly": true,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "X-Magento-Vary",
+            "value": "9bf9a599123e6402b85cde67144717a08b817412",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1784874728.75333,
+            "httpOnly": true,
+            "secure": false,
+            "sameSite": "Lax"
+        },
+        {
+            "name": "form_key",
+            "value": "rxXe4ICIK8WPXp7B",
+            "domain": "10.0.0.104",
+            "path": "/",
+            "expires": 1753425128,
+            "httpOnly": false,
+            "secure": false,
+            "sameSite": "Lax"
+        }
+    ],
+    "origins": [
+        {
+            "origin": "http://10.0.0.104:7770",
+            "localStorage": [
+                {
+                    "name": "recently_viewed_product",
+                    "value": "{}"
+                },
+                {
+                    "name": "mage-cache-storage",
+                    "value": "{}"
+                },
+                {
+                    "name": "mage-cache-storage-section-invalidation",
+                    "value": "{}"
+                },
+                {
+                    "name": "recently_viewed_product_previous",
+                    "value": "{}"
+                },
+                {
+                    "name": "product_data_storage",
+                    "value": "{}"
+                },
+                {
+                    "name": "mage-cache-timeout",
+                    "value": "\"2026-07-24T06:32:08.979Z\""
+                },
+                {
+                    "name": "recently_compared_product_previous",
+                    "value": "{}"
+                },
+                {
+                    "name": "recently_compared_product",
+                    "value": "{}"
+                }
+            ]
+        }
+    ]
+}

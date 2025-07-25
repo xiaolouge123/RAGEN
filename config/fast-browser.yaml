@@ -1,0 +1,72 @@
+defaults:
+  - base-browser
+
+# 快速rollout优化配置
+# 主要目标：大幅减少每个step的时间
+
+trainer:
+  experiment_name: fast-browser-rollout
+  total_training_steps: 50  # 减少训练步数用于测试
+  test_freq: 5
+
+# 核心优化：减少环境交互时间
+agent_proxy:
+  max_turn: 5  # 进一步减少到5轮，大幅缩短轨迹
+  action_sep: "\n"
+  max_actions_per_turn: 1  # 每轮只允许1个action，简化交互
+  use_turn_scores: True
+  enable_think: False  # 禁用think，减少生成时间
+  reward_normalization:
+    grouping: "state"
+    method: "identity"
+
+# 环境管理优化
+es_manager:
+  format_penalty: -0.1
+  train:
+    env_groups: 16  # 增加并行环境组
+    group_size: 2   # 大幅减少组大小，快速完成
+    env_configs:
+      tags: ["WebBrowser"]
+      n_groups: [16]
+  val:
+    env_groups: 4   # 验证时也减少规模
+    group_size: 1
+    env_configs:
+      tags: ["WebBrowser"]
+      n_groups: [4]
+
+# 生成配置优化
+actor_rollout_ref:
+  rollout:
+    mode: async
+    max_model_len: 8192     # 进一步减少context长度
+    response_length: 256    # 大幅减少响应长度
+    gpu_memory_utilization: 0.7
+    max_num_batched_tokens: 32768
+    temperature: 1.2        # 稍微增加温度，增加随机性减少卡住
+    rollout_filter_ratio: 0.8  # 保留更多样本
+    rollout_filter_type: std
+    enforce_eager: True
+    free_cache_engine: True
+    val_kwargs:
+      do_sample: True
+      temperature: 0.7      # 验证时也增加随机性
+
+# 微调batch size以匹配新的环境配置
+micro_batch_size_per_gpu: 2
+ppo_mini_batch_size: 32
+
+# 自定义环境配置 - 加速WebBrowser
+custom_envs:
+  WebBrowser:
+    env_type: WebBrowser
+    env_config:
+      max_steps: 20         # 减少最大步数
+      browser_retries_limit: 1  # 减少重试次数
+    max_tokens: 256         # 减少最大token数
+
+# 🚀 性能关键优化：禁用LLM reward model
+# 这是rollout速度慢的主要原因！每个rollout都要调用LLM API评分
+# 禁用后可以节省每个step 10-30秒的时间
+llm_reward_model_api: null  # 完全禁用LLM reward model 
