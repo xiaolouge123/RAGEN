@@ -14,6 +14,10 @@ import numpy as np
 from ragen.utils import register_resolvers
 register_resolvers()
 
+
+torch.autograd.set_detect_anomaly(True) # for nan detection in backward
+
+os.environ["RAY_TMPDIR"] = "/rt-vepfs/zyc/expr/ray_tmp"
 ray.init(
     runtime_env={
         "env_vars": {
