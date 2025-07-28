@@ -12,6 +12,8 @@ from .metamathqa.env import MetaMathQAEnv
 from .metamathqa.config import MetaMathQAEnvConfig
 from .webbrowser.config import WebBrowserEnvConfig
 from .webbrowser.env import WebBrowserEnv
+from .webarenabrowser.config import WebArenaBrowserEnvConfig
+from .webarenabrowser.env import WebArenaBrowserEnv
 
 
 REGISTERED_ENVS = {
@@ -22,6 +24,7 @@ REGISTERED_ENVS = {
     # 'alfworld': AlfredTXTEnv,
     'metamathqa': MetaMathQAEnv,
     'webbrowser': WebBrowserEnv,
+    'webarenabrowser': WebArenaBrowserEnv,
 }
 
 REGISTERED_ENV_CONFIGS = {
@@ -32,6 +35,7 @@ REGISTERED_ENV_CONFIGS = {
     # 'alfworld': AlfredEnvConfig,
     'metamathqa': MetaMathQAEnvConfig,
     'webbrowser': WebBrowserEnvConfig,
+    'webarenabrowser': WebArenaBrowserEnvConfig,
 }
 
 try:

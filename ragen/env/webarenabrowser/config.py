@@ -3,11 +3,11 @@ from typing import Dict
 from dataclasses import dataclass, field
 from ragen.env.webbrowser.config import WebBrowserEnvConfig
 
-REDDIT = os.environ.get("REDDIT", "")
-SHOPPING = os.environ.get("SHOPPING", "")
-SHOPPING_ADMIN = os.environ.get("SHOPPING_ADMIN", "")
-GITLAB = os.environ.get("GITLAB", "")
-WIKIPEDIA = os.environ.get("WIKIPEDIA", "")
+REDDIT = os.environ.get("REDDIT", "http://10.0.0.104:9999")
+SHOPPING = os.environ.get("SHOPPING", "http://10.0.0.104:7770")
+SHOPPING_ADMIN = os.environ.get("SHOPPING_ADMIN", "http://10.0.0.104:7780/admin")
+GITLAB = os.environ.get("GITLAB", "http://10.0.0.104:8023")
+WIKIPEDIA = os.environ.get("WIKIPEDIA", "http://10.0.0.104:8888")
 
 ACCOUNTS = {
     "reddit": {"username": "MarvelsGrantMan136", "password": "test1234"},
@@ -30,10 +30,10 @@ class WebArenaBrowserEnvConfig(WebBrowserEnvConfig):
     # login state dir
     storage_state_dir: str = field(default="/rt-vepfs/zyc/workspaces/RAGEN/data/webarena/auth")
 
-    url_mapping: Dict[str, str] = {
+    url_mapping: dict = field(default_factory=lambda: {
         "__SHOPPING_ADMIN__": SHOPPING_ADMIN,
         "__SHOPPING__": SHOPPING,
         "__REDDIT__": REDDIT,
         "__GITLAB__": GITLAB,
         "__WIKIPEDIA__": WIKIPEDIA,
-    }
+    })

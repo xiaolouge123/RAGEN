@@ -193,7 +193,7 @@ class ContextManager:
 
     def _parse_response(self, response: str, env_tag: str) -> List:
         pattern = r'<think>(.*?)</think>\s*<answer>(.*?)</answer>' if self.config.agent_proxy.enable_think else r'<answer>(.*?)</answer>'
-        if env_tag in ["WebBrowser"]:
+        if env_tag in ["WebBrowser", "WebArenaBrowser"]:
             llm_response = response
             actions = []
             answer = ""
@@ -410,7 +410,7 @@ class ContextManager:
             env_tag = env_output["tag"]
 
             for idx, content in enumerate(env_output["history"]):
-                if env_tag in ["WebBrowser"]:
+                if env_tag in ["WebBrowser", "WebArenaBrowser"]:
                     if idx == 0 and content.get("goal", None):
                         messages[-1]["content"] += f"\n{content['goal']}" # 只在首轮次 user prompt 最后添加任务目标。
                     if idx == 0:

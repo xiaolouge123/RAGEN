@@ -7,6 +7,7 @@ from typing import Optional, Any
 
 # register openended gym environments
 import browsergym.core
+from browsergym.core import _get_global_playwright
 import gymnasium as gym
 from browsergym.utils.obs import flatten_dom_to_str, overlay_som
 
@@ -22,11 +23,11 @@ from ragen.env.webarenabrowser.config import (
     SHOPPING,
     SHOPPING_ADMIN,
     REDDIT,
+    WIKIPEDIA
 )   
 from ragen.utils import all_seed
 from ragen.llm_agent.observations import BrowserOutputObservation
 
-from playwright.sync_api import sync_playwright
 
 
 ENABLE_CONTEXT_CACHE = True
@@ -76,6 +77,17 @@ class Task:
             
     def get_task_goal(self):
         return f"Go to {self.data_url} and then {self.instruction}"
+    
+
+# class DummyWrapper(gym.Wrapper):
+#     def reset(self, *, seed=None, options=None, **kwargs):
+#         print("DummyWrapper got kwargs:", kwargs)
+#         return self.env.reset(seed=seed, options=options, **kwargs)
+    
+def monkey_patch_new_reset_with_kwargs(self, *, seed=None, options=None, **kwargs):
+    """A new reset function that accepts and forwards kwargs."""
+    self._has_reset = True
+    return self.env.reset(seed=seed, options=options, **kwargs)
 
 
 class WebArenaBrowserEnv(WebBrowserEnv):
@@ -93,16 +105,14 @@ class WebArenaBrowserEnv(WebBrowserEnv):
         if not storage_state.exists():
             return True # expired
 
-        context_manager = sync_playwright()
-        playwright = context_manager.__enter__()
-        browser = playwright.chromium.launch(headless=True, slow_mo=0)
+        pw = _get_global_playwright()
+        browser = pw.chromium.launch(headless=True, slow_mo=0)
         context = browser.new_context(storage_state=storage_state)
         page = context.new_page()
         page.goto(url)
         time.sleep(1)
         d_url = page.url
         content = page.content()
-        context_manager.__exit__()
         if keyword:
             return keyword not in content
         else:
@@ -113,9 +123,9 @@ class WebArenaBrowserEnv(WebBrowserEnv):
             
     def login(self,comb: list[str], storage_state_path: str) -> None:
         # current pretend only single website login
-        context_manager = sync_playwright()
-        playwright = context_manager.__enter__()
-        browser = playwright.chromium.launch(headless=True)
+
+        pw = _get_global_playwright()
+        browser = pw.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
 
@@ -155,10 +165,9 @@ class WebArenaBrowserEnv(WebBrowserEnv):
 
         context.storage_state(path=storage_state_path)
 
-        context_manager.__exit__()
-
 
     def browser_process(self):
+        gym.wrappers.OrderEnforcing.reset = monkey_patch_new_reset_with_kwargs
         env = gym.make(
             'browsergym/openended',
             task_kwargs={'start_url': 'about:blank', 'goal': 'PLACEHOLDER_GOAL'}, # 永远入口页面都是空白页，reset 后也是空白页。
@@ -170,11 +179,12 @@ class WebArenaBrowserEnv(WebBrowserEnv):
             context_cache_kwargs={"redis_url": REDIS_URL, "ttl": TTL, "cacheable_resource_types": CACHE_RESOURCE_TYPES},
             resource_filter_kwargs=RESOURCE_FILTER_KWARGS,
         )
+        # env = DummyWrapper(env)
         obs, info = env.reset() # 这个环境在 browsergym.core.env 中定义 BrowserEnv.reset
         self.render_cache = obs
-        logger.info('Successfully called env.reset')
+        logger.info('Successfully called env.reset in browser_process')
         
-        logger.info('Browser env started.')
+        logger.info('Browser env started in browser_process.')
 
         while should_continue():
             try:
@@ -194,7 +204,11 @@ class WebArenaBrowserEnv(WebBrowserEnv):
                         if action_data:
                             pw_context_kwargs = action_data
                             logger.info(f"Reset with context kwargs: {pw_context_kwargs}")
-                            obs, info = env.reset(**pw_context_kwargs)
+                            storage_state = pw_context_kwargs.get('storage_state', None)
+                            if storage_state:
+                                obs, info = env.reset(storage_state=storage_state)
+                            else:
+                                obs, info = env.reset()
                         else:
                             obs, info = env.reset()
                         
@@ -217,10 +231,13 @@ class WebArenaBrowserEnv(WebBrowserEnv):
                         self.browser_side.send(('RESET_DONE', self.render_cache)) # send back the init status
                         continue
                     elif unique_request_id == 'LOGIN':
-                        login_succ = self.login()
+                        logger.info('Login recv, try to login...')
+                        cur_site, storage_state_path = action_data
+                        login_succ = self.login(cur_site, storage_state_path)
                         self.browser_side.send(('LOGIN', login_succ))
                         continue
                     elif unique_request_id == 'IS_EXPIRED':
+                        logger.info('IS_EXPIRED recv, try to check if expired...')
                         storage_state, url, keyword, match = action_data
                         is_expired = self.is_expired(storage_state, url, keyword, match)
                         self.browser_side.send(('IS_EXPIRED', is_expired))
@@ -261,10 +278,24 @@ class WebArenaBrowserEnv(WebBrowserEnv):
         with all_seed(seed):
             self.current_task_idx = random.randint(0, len(self.data['train']) - 1)
         task = self.data['train'][self.current_task_idx]
+        
+        if task['data_source'] == 'shopping' and "__SHOPPING__" in task['data_url']:
+            data_url = task['data_url'].replace("__SHOPPING__", SHOPPING)
+        elif task['data_source'] == 'shopping_admin' and "__SHOPPING_ADMIN__" in task['data_url']:
+            data_url = task['data_url'].replace("__SHOPPING_ADMIN__", SHOPPING_ADMIN)
+        elif task['data_source'] == 'gitlab' and "__GITLAB__" in task['data_url']:
+            data_url = task['data_url'].replace("__GITLAB__", GITLAB)
+        elif task['data_source'] == 'reddit' and "__REDDIT__" in task['data_url']:
+            data_url = task['data_url'].replace("__REDDIT__", REDDIT)
+        elif task['data_source'] == 'wikipedia' and "__WIKIPEDIA__" in task['data_url']:
+            data_url = task['data_url'].replace("__WIKIPEDIA__", WIKIPEDIA)
+        else:
+            data_url = task['data_url']
+        
         self.current_task = Task(
             task_idx=self.current_task_idx, 
             data_source=task["data_source"], 
-            data_url=task["data_url"], 
+            data_url=data_url, 
             instruction=task["instruction"], 
             action_tip=task["action_tip"], 
             ground_truth=task["ground_truth"],
@@ -280,37 +311,42 @@ class WebArenaBrowserEnv(WebBrowserEnv):
         keyword = KEYWORDS[SITES.index(cur_site)]
         match = EXACT_MATCH[SITES.index(cur_site)]
         storage_state_path = Path(self.config.storage_state_dir) / f"{cur_site}_state.json"
+        
         if self.current_task.require_login:
+            is_expired = False
             login_time_out = 60
             start_time = time.time()
-            self.browser_side.send(('IS_EXPIRED', (storage_state_path, url, keyword, match)))
+            self.agent_side.send(('IS_EXPIRED', (storage_state_path, url, keyword, match)))
             while True:
                 if should_exit() or time.time() - start_time > login_time_out:
                     logger.error(f"Timeout or exit signal received during IS_EXPIRED check after {login_time_out} seconds.")
                     raise TimeoutError('Browser environment took too long to respond during IS_EXPIRED check.')
-                if self.browser_side.poll(timeout=0.01):
-                    unique_request_id, obs = self.browser_side.recv()
+                if self.agent_side.poll(timeout=0.01):
+                    unique_request_id, obs = self.agent_side.recv()
                     if unique_request_id == 'IS_EXPIRED':
                         is_expired = obs
-                        if is_expired:
-                            _start_time = time.time()
-                            self.browser_side.send(('LOGIN', (cur_site, storage_state_path)))
-                            while True:
-                                if should_exit() or time.time() - _start_time > login_time_out:
-                                    logger.error(f"Timeout or exit signal received during LOGIN after {login_time_out} seconds.")
-                                    raise TimeoutError('Browser environment took too long to respond during LOGIN.')
-                                if self.browser_side.poll(timeout=0.01):
-                                    unique_request_id, obs = self.browser_side.recv()
-                                    if unique_request_id == 'LOGIN':
-                                        login_succ = obs
-                                        if login_succ:
-                                            logger.info("Login success")
-                                            break
-                                        else:
-                                            logger.error("Login failed")
-                                            raise Exception("Login failed")
+                        break
+            logger.info(f"IS_EXPIRED result: {is_expired}")
+            
+            if is_expired:
+                _start_time = time.time()
+                self.agent_side.send(('LOGIN', ([cur_site], storage_state_path)))
+                while True:
+                    if should_exit() or time.time() - _start_time > login_time_out:
+                        logger.error(f"Timeout or exit signal received during LOGIN after {login_time_out} seconds.")
+                        raise TimeoutError('Browser environment took too long to respond during LOGIN.')
+                    if self.agent_side.poll(timeout=0.01):
+                        unique_request_id, obs = self.agent_side.recv()
+                        if unique_request_id == 'LOGIN':
+                            login_succ = obs
+                            if login_succ:
+                                logger.info("Login success")
+                                break
+                            else:
+                                logger.error("Login failed")
+                                raise Exception("Login failed")
         if os.path.exists(storage_state_path):
-            pw_context_kwargs = {"storage_state": storage_state_path}
+            pw_context_kwargs = {"storage_state": str(storage_state_path)}
         
         # origin reset logic
         self.agent_side.send(('RESET', pw_context_kwargs)) # reset the browser to blank page
