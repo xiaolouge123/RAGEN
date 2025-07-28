@@ -76,13 +76,8 @@ class Task:
     storage_state: str
             
     def get_task_goal(self):
-        return f"Go to {self.data_url} and then {self.instruction}"
+        return f"Go to {self.data_url} and then answer {self.instruction}"
     
-
-# class DummyWrapper(gym.Wrapper):
-#     def reset(self, *, seed=None, options=None, **kwargs):
-#         print("DummyWrapper got kwargs:", kwargs)
-#         return self.env.reset(seed=seed, options=options, **kwargs)
     
 def monkey_patch_new_reset_with_kwargs(self, *, seed=None, options=None, **kwargs):
     """A new reset function that accepts and forwards kwargs."""
@@ -179,7 +174,6 @@ class WebArenaBrowserEnv(WebBrowserEnv):
             context_cache_kwargs={"redis_url": REDIS_URL, "ttl": TTL, "cacheable_resource_types": CACHE_RESOURCE_TYPES},
             resource_filter_kwargs=RESOURCE_FILTER_KWARGS,
         )
-        # env = DummyWrapper(env)
         obs, info = env.reset() # 这个环境在 browsergym.core.env 中定义 BrowserEnv.reset
         self.render_cache = obs
         logger.info('Successfully called env.reset in browser_process')
